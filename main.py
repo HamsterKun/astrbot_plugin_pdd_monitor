@@ -21,9 +21,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import random
 import re
+import statistics
 import time
 from datetime import datetime
 from typing import Any, Optional
@@ -226,6 +228,104 @@ def overlap_score(keyword_tokens: set[str], title_tokens: set[str]) -> tuple[flo
         return 0.0, set()
     hit = keyword_tokens & title_tokens
     return len(hit) / len(keyword_tokens), hit
+
+
+# 配件/引流词：标题里出现、而关键词里没有时，说明这条不是完整商品。
+# 「选配」是拼多多常见的引流 SKU（一个链接挂多个型号，标的是最低配的价格），
+# 它价格低、标题又含型号，是短关键词下最容易误选的一类。
+ACCESSORY_WORDS = (
+    "配件", "适用", "兼容", "专用", "转接", "扣具", "底座", "支架",
+    "硅脂", "导热", "硅胶", "选配", "单拍", "定金", "补差", "邮费",
+    "替换", "替代", "维修", "清洁", "工具", "仅适配",
+)
+# 降权系数：命中配件词的那条，重合度打对折，让完整商品优先
+ACCESSORY_PENALTY = 0.5
+
+
+def accessory_penalty(title: str, keyword_tokens: set[str]) -> float:
+    """标题像配件就降权，但如果关键词本身就含配件词（如「手机壳」），不降。"""
+    text = title or ""
+    if not text:
+        return 1.0
+    if any(word in keyword_tokens for word in ACCESSORY_WORDS):
+        return 1.0
+    return ACCESSORY_PENALTY if any(word in text for word in ACCESSORY_WORDS) else 1.0
+
+
+# --------------------------------------------------------------------------- #
+# 价格离群剔除
+# --------------------------------------------------------------------------- #
+def filter_price_outliers(
+    items: list[dict],
+    k: float = 3.0,
+    min_samples: int = 6,
+    min_keep_ratio: float = 0.15,
+) -> tuple[list[dict], dict[str, Any]]:
+    """把低价离群的商品剔掉（对数空间的中位数绝对偏差）。
+
+    为什么在对数空间：商品价格右偏严重，¥3.99 到 ¥3000 差 750 倍，
+    线性尺度下几个高价就能把阈值撑开，反而剔不掉低价配件。
+
+    为什么用 MAD 而不是标准差或 IQR：
+    - 标准差会被离群点本身带偏，越离谱的点反而越剔不掉；
+    - IQR 在价格跨度大时窗口过宽（实测 1.5×IQR 一条都剔不掉），
+      而 MAD 只看「偏离中位数多远」，对「少量配件混进大堆正品」更灵敏。
+
+    为什么只剔下限、不剔上限：目标是取最低价，高价离群（套装、多件装）
+    不影响结果，剔了反而可能误伤；低价离群（配件、引流 SKU）才会把
+    「最低价」拉到完全无关的价位。而且只剔单边，能避开「配件数量远超
+    正品时，把少量正品当离群剔掉」这个致命误判。
+
+    两道保护：
+    - 样本少于 min_samples 不做（统计量不可靠）
+    - 保留比例低于 min_keep_ratio 视为剔除过度，放弃剔除
+
+    参数 k 越大越宽容：2 严格、3 标准、4 宽松。
+    """
+    total = len(items)
+    if not items:
+        return items, {"outlier_mode": "off", "outlier_total": 0}
+
+    if len(items) < min_samples:
+        return items, {
+            "outlier_mode": "skip",
+            "outlier_total": total,
+            "outlier_note": f"仅 {total} 条，样本太少不做剔除",
+        }
+
+    logs = [math.log(max(1, int(i.get("price_cents") or 1))) for i in items]
+    center = statistics.median(logs)
+    mad = statistics.median([abs(x - center) for x in logs])
+    if mad <= 1e-9:
+        # 价格几乎完全一致（或绝大多数一致），给一个极小的尺度兜底。
+        # 这时阈值贴着中位数，下限几乎等于中位数本身，不会误剔任何一侧。
+        mad = 0.01
+
+    floor = math.exp(center - k * mad)
+    kept = [i for i in items if i.get("price_cents", 0) >= floor]
+    dropped = total - len(kept)
+
+    if not dropped:
+        return items, {
+            "outlier_mode": "skip",
+            "outlier_total": total,
+            "outlier_note": "价格分布连续，没有可剔除的离群项",
+        }
+
+    if len(kept) < max(3, int(total * min_keep_ratio)):
+        return items, {
+            "outlier_mode": "skip",
+            "outlier_total": total,
+            "outlier_note": f"价格过于分散，剔除会伤到主体（只剩 {len(kept)}/{total}），已放弃",
+        }
+
+    return kept, {
+        "outlier_mode": "mad",
+        "outlier_total": total,
+        "outlier_kept": len(kept),
+        "outlier_dropped": dropped,
+        "outlier_floor": int(floor),
+    }
 
 
 def normalize_cookie(raw: str) -> str:
@@ -1093,18 +1193,36 @@ class PDDMonitorPlugin(Star):
         # 先按价格升序：后面「前 N 条」「该商品往后两条」都以这个顺序为准
         candidates.sort(key=lambda c: c["price_cents"])
 
+        # 剔除离群价格：搜索「9700X」会混进 ¥3.99 的硅脂、¥19.9 的扣具，
+        # 它们的标题同样含 9700X，只靠标题匹配分不出来（关键词越短越分不出来），
+        # 得先按价格把这一簇剔掉，剩下的才是同一类商品。
+        pool = candidates
+        outlier_info: dict[str, Any] = {"outlier_mode": "off", "outlier_total": len(candidates)}
+        if bool(self.cfg("filter_price_outliers", True)):
+            pool, outlier_info = filter_price_outliers(candidates, k=self._outlier_k())
+
         anchor_idx = 0
         match_info: dict[str, Any] = {"match_mode": "off"}
-        if bool(self.cfg("keyword_filter_by_title", False)):
-            anchor_idx, match_info = self._pick_by_title(keyword, candidates)
+        if bool(self.cfg("keyword_filter_by_title", True)):
+            anchor_idx, match_info = self._pick_by_title(keyword, pool)
 
-        anchor = dict(candidates[anchor_idx])
+        anchor = dict(pool[anchor_idx])
         anchor["keyword"] = keyword
         # samples[0] 是选中的锚点，后面两条是它后面的报价
-        anchor["samples"] = candidates[anchor_idx: anchor_idx + 3]
-        anchor["count"] = len(candidates)
+        anchor["samples"] = pool[anchor_idx: anchor_idx + 3]
+        anchor["count"] = len(pool)
+        anchor["scanned"] = len(candidates)
         anchor.update(match_info)
+        anchor.update(outlier_info)
         return anchor
+
+    def _outlier_k(self) -> float:
+        """MAD 的倍数：越大越宽容。2 严格、3 标准、4 宽松。"""
+        try:
+            k = float(self.cfg("outlier_k", 3.0))
+        except (TypeError, ValueError):
+            k = 3.0
+        return max(1.0, min(6.0, k))
 
     def _title_pool_size(self) -> int:
         try:
@@ -1147,23 +1265,27 @@ class PDDMonitorPlugin(Star):
                 "match_note": f"前 {len(pool)} 条标题都没含关键词（子串匹配）",
             }
 
-        scored: list[tuple[float, int, int, int, set[str]]] = []
+        scored: list[tuple] = []
         for i, cand in enumerate(pool):
-            score, hit = overlap_score(kw_tokens, tokenize(cand["title"]))
+            raw, hit = overlap_score(kw_tokens, tokenize(cand["title"]))
+            # 标题像配件/引流 SKU 的降权，让完整商品排到前面。
+            # 排序用降权后的分，展示仍用原始重合度 + 标注，免得「明明全命中却显示 50%」。
+            penalty = accessory_penalty(cand["title"], kw_tokens) if raw > 0 else 1.0
             # 重合度 > 命中词数 > 价格低 > 索引靠前；
-            # 索引唯一，所以比较永远不会落到最后那个 set 上
-            scored.append((score, len(hit), -cand["price_cents"], i, hit))
+            # 索引唯一，所以比较永远不会落到后面那个 set 上
+            scored.append((raw * penalty, len(hit), -cand["price_cents"], i, hit, raw, penalty))
         scored.sort(reverse=True)
 
-        best_score, _, _, best_i, best_hit = scored[0]
-        if best_score <= 0:
+        best_final, _, _, best_i, best_hit, best_raw, best_pen = scored[0]
+        if best_final <= 0:
             return 0, {
                 "match_mode": "fallback",
                 "match_note": f"前 {len(pool)} 条标题都没命中关键词，按最低价取",
             }
         return best_i, {
             "match_mode": "jieba",
-            "match_score": round(best_score, 2),
+            "match_score": round(best_raw, 2),
+            "match_penalized": best_pen < 1.0,
             "match_index": best_i + 1,
             "match_pool": len(pool),
             "match_tokens": sorted(best_hit),
@@ -1621,9 +1743,24 @@ class PDDMonitorPlugin(Star):
         if tokens:
             shown = "、".join(str(t) for t in tokens[:4])
             line += f"（命中 {shown}）"
+        if best.get("match_penalized"):
+            line += " · 含配件词已降权"
         if mode == "substring":
             line += " · 子串匹配"
         return line
+
+    def _outlier_line(self, best: dict) -> str:
+        """说明价格离群剔除的结果。"""
+        mode = str(best.get("outlier_mode") or "off")
+        total = best.get("outlier_total") or 0
+        if mode == "off":
+            return "过滤：未启用价格离群剔除"
+        if mode == "skip":
+            return f"过滤：{best.get('outlier_note') or '未做剔除'}（共 {total} 条）"
+        kept = best.get("outlier_kept") or 0
+        dropped = best.get("outlier_dropped") or 0
+        floor = fmt_yuan(best.get("outlier_floor"))
+        return f"过滤：剔除 {dropped} 条低价离群，保留 {kept}/{total} 条（下限 {floor}）"
 
     async def _debug_keyword(self, keyword: str) -> str:
         keyword = (keyword or "").strip()
@@ -1637,7 +1774,8 @@ class PDDMonitorPlugin(Star):
                 f"「{keyword}」搜索失败\n{shorten(str(e), 60)}\n"
                 f"{self._cookie_line()}\n{self._transport_line()}"
             )
-        lines = [f"「{keyword}」搜到 {best.get('count', 0)} 条"]
+        lines = [f"「{keyword}」搜到 {best.get('scanned') or best.get('count', 0)} 条"]
+        lines.append(self._outlier_line(best))
         lines.append(f"当前最低：{fmt_yuan(best['price_cents'])}")
         lines.append(f"　{shorten(best.get('title') or '', 24)}")
         if best.get("goods_id"):
