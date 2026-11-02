@@ -1,0 +1,84 @@
+{
+  "cookie": {
+    "type": "string",
+    "description": "拼多多网页 cookie",
+    "default": "",
+    "hint": "必填。从手机端或电脑端网页版拼多多（mobile.yangkeduo.com）登录后，把请求头里的整条 Cookie 复制进来，必须包含 PDDAccessToken。建议用你平时一直在用的主号，新注册的小号大概率已被风控。插件只把 cookie 放在请求头里，不会写进日志、数据文件或聊天回复。"
+  },
+  "user_agent": {
+    "type": "string",
+    "description": "请求用的 User-Agent",
+    "default": "",
+    "hint": "留空用内置的 iPhone Safari UA。最安全的做法是从你取 cookie 的那台手机上复制它自己的 UA 填进来——UA 声称的设备与 cookie 绑定的设备一致，是最不容易被识别的组合。填 Android UA 也能用，但要和 URL 的设备形态一致（本插件抓的是 mobile 站）。"
+  },
+  "transport": {
+    "type": "string",
+    "description": "网络传输方式（影响 TLS 指纹）",
+    "default": "auto",
+    "hint": "auto = 装了 curl_cffi 就用它，否则回落 httpx；curl_cffi = 强制用它（没装会回落并告警）；httpx = 强制用内置库。curl_cffi 能模拟 Safari 的 TLS 与 HTTP/2 指纹，这是风控最常看、也最难伪装的一层，强烈建议用 auto 并 pip 装上 curl_cffi。"
+  },
+  "impersonate": {
+    "type": "string",
+    "description": "curl_cffi 模拟的浏览器指纹",
+    "default": "safari_ios",
+    "hint": "只在 transport 用 curl_cffi 时生效。可选 safari_ios、safari18_0、safari17_0、chrome120 等，具体取决于 curl_cffi 版本。填的名字当前版本不支持时会自动依次回落，不影响使用。"
+  },
+  "warmup_home": {
+    "type": "bool",
+    "description": "首轮巡检前先访问一次首页",
+    "default": true,
+    "hint": "开启后，插件会先打开 mobile.yangkeduo.com 首页，让服务端下发基础的设备 cookie（api_uid 等），再去搜关键词。真实用户进站都是这个顺序，直接拿着搜索 URL 打过来反而异常。只多一次请求，建议保持开启。"
+  },
+  "search_sort": {
+    "type": "string",
+    "description": "搜索页排序方式",
+    "default": "price",
+    "hint": "price = 价格升序（最便宜的排在第一页，推荐）；_price = 价格降序。插件最终都会在结果里取最小价，但降序的第一页是最贵的一批，取出来的「最低价」会明显虚高，所以别轻易改成 _price。"
+  },
+  "keyword_filter_by_title": {
+    "type": "bool",
+    "description": "按标题分词匹配选品（推荐开启）",
+    "default": true,
+    "hint": "开启后：把关键词和商品标题都分词，在前 N 条商品里取「分词重合度最高」的那条作为价格参考，而不是直接取最便宜的那条。原因是搜索结果里混着大量「配件」「兼容」「替代款」，价格常比正主低好几倍——不匹配的话，盯「9700X」可能记成三块钱的硅脂。关闭则始终取最低价。"
+  },
+  "title_match_top_n": {
+    "type": "int",
+    "description": "参与标题匹配的商品条数（前 N 条）",
+    "default": 5,
+    "hint": "取价格最低的前 N 条商品和目标关键词分词比对，范围 1~20。注意：这个值不影响请求次数，所有商品都在同一次搜索响应里，取 5 条还是 20 条对风控没有任何区别，只影响匹配精度和本地计算量。设太大会把价格高出很多的商品也拉进来，反而容易选错；5 条通常足够。"
+  },
+  "check_interval_minutes": {
+    "type": "int",
+    "description": "自动巡检间隔（分钟）",
+    "default": 30,
+    "hint": "网页有账号级风控，不建议低于 20 分钟。监控项多的话把间隔调大更安全。插件会把整轮的请求摊平到这个间隔里，而不是集中在开头几秒打完。"
+  },
+  "request_timeout": {
+    "type": "int",
+    "description": "单次页面请求超时（秒）",
+    "default": 15
+  },
+  "notify_at_new_low": {
+    "type": "bool",
+    "description": "出现历史最低价时主动推送",
+    "default": true
+  },
+  "max_goods": {
+    "type": "int",
+    "description": "最多监控的关键词数量",
+    "default": 50,
+    "hint": "每轮巡检对每个关键词发一次请求。数量越多单轮越久，也越容易踩到风控。"
+  },
+  "daily_report_time": {
+    "type": "string",
+    "description": "每天定时推送「今日行情」的时间",
+    "default": "",
+    "hint": "格式 20:00，留空表示不自动推送。实际推送时间会在该时间点之后的第一轮巡检生效。"
+  },
+  "risk_backoff_max_hours": {
+    "type": "int",
+    "description": "触发限流后的最长冷却时间（小时）",
+    "default": 8,
+    "hint": "命中限流时按 1h、2h、4h… 指数退避，到这里封顶。拼多多的限流按账号算，被限后继续按原间隔请求只会越限越久，所以宁可按更长的间隔等。"
+  }
+}
