@@ -11,11 +11,47 @@
     "default": "",
     "hint": "留空用内置的 iPhone Safari UA。最安全的做法是从你取 cookie 的那台手机上复制它自己的 UA 填进来——UA 声称的设备与 cookie 绑定的设备一致，是最不容易被识别的组合。填 Android UA 也能用，但要和 URL 的设备形态一致（本插件抓的是 mobile 站）。"
   },
+  "proxy": {
+    "type": "string",
+    "description": "出口代理（机器人部署在云服务器时必填）",
+    "default": "",
+    "hint": "留空表示直连。如果 AstrBot 跑在阿里云、腾讯云等机房，出口 IP 属于云厂商网段，平台对这类 IP 的信任度远低于家宽——典型症状是同一账号在你自己电脑的浏览器里能搜，插件却一直返回「系统繁忙」的降级页。填一条家宽或住宅代理即可绕开：http://host:port、http://user:pass@host:port 或 socks5://host:port。curl_cffi 自带 socks5 支持；走 httpx 时 socks5 需要额外装 socksio。走内网穿透（frp / Sakura Frp）时有两个坑：隧道类型必须是 tcp，http 类型不接受 CONNECT；另外部分服务商会对隧道做 HTTP 内容合规检测，明文 HTTP 一律拦成 501（响应头带 Server: SakuraFrp，页面写「请启用 HTTPS 后访问」），这种情况换线路换端口都没用，改用 socks5h:// 地址即可绕开（写 socks5h 不写 socks5：后者会把域名在客户端解析成 IP 再发给代理，容易解析到 IPv6 而连不通，报 curl 97）。curl_cffi 原生支持。配合 /盯价 debug 的「代理」行确认是否生效。"
+  },
+  "fetch_mode": {
+    "type": "string",
+    "description": "取数方式",
+    "default": "browser",
+    "hint": "browser = 开无头 Chromium 取数（推荐，也是目前唯一稳定的方式）。搜索页为客户端渲染，HTML 中没有数据，商品由前端 XHR 拉回后解密再渲染，纯 HTTP 只能拿到空骨架。http = 抓 HTML 提取 rawData 的旧路线，基本取不到价，仅用于排查。auto = 先试 http，取不到再转浏览器。选 browser 需装 playwright；Chromium 内核会在首次取数时自动下载（见 browser_auto_install）。"
+  },
+  "browser_channel": {
+    "type": "string",
+    "description": "浏览器内核通道",
+    "default": "",
+    "hint": "留空用 Playwright 默认的无头内核（chrome-headless-shell，比较精简，指纹好认）。填 chromium 会用完整内核的新无头模式，更像真浏览器。如果日志里一直出现「系统繁忙」，优先改成 chromium 再试。"
+  },
+  "browser_headless": {
+    "type": "bool",
+    "description": "浏览器无头运行",
+    "default": true,
+    "hint": "服务器上没有桌面环境，保持开启。关掉需要有图形界面（或装 Xvfb），一般不需要动。"
+  },
+  "browser_timeout": {
+    "type": "int",
+    "description": "浏览器取数超时（秒）",
+    "default": 45,
+    "hint": "从打开搜索页到截获商品数据的总时限。走内网穿透时链路比直连慢，家里上行带宽小的话调大一些（60~90）。超时会报出具体原因（跳登录页 / 系统繁忙 / 没截到明文），照提示排查。"
+  },
+  "browser_auto_install": {
+    "type": "bool",
+    "description": "缺内核时自动下载",
+    "default": true,
+    "hint": "pip 只装 playwright 这个 Python 包，Chromium 内核要另外下载（一百多 MB），首次安装插件时一定缺。开启后，取数时发现内核不存在会自动执行 python -m playwright install chromium，日志里能看到进度，下载完自动接着启动。关掉则只报错让你自己装。注：browser_channel 填了系统浏览器（chrome/edge）时不走自动下载。"
+  },
   "transport": {
     "type": "string",
     "description": "网络传输方式（影响 TLS 指纹）",
     "default": "auto",
-    "hint": "auto = 装了 curl_cffi 就用它，否则回落 httpx；curl_cffi = 强制用它（没装会回落并告警）；httpx = 强制用内置库。curl_cffi 能模拟 Safari 的 TLS 与 HTTP/2 指纹，这是风控最常看、也最难伪装的一层，强烈建议用 auto 并 pip 装上 curl_cffi。"
+    "hint": "curl_cffi 已是默认依赖（写在 requirements.txt 里），正常情况下保持 auto 即可，插件会自动用它模拟 Safari 的 TLS 与 HTTP/2 指纹。如果 /盯价 debug 的「传输」一行显示 httpx，说明依赖没装上（常见于 Docker 或受限环境），执行 pip install curl_cffi 后重载插件。httpx = 强制用内置库，只在排查问题时用。"
   },
   "impersonate": {
     "type": "string",
@@ -58,6 +94,12 @@
     "description": "离群剔除的严格程度",
     "default": 3,
     "hint": "1~6，越小越严格（剔得越多），越大越宽松。3 是标准值：只剔掉比总体中位数低一大截的那些。调到 1~2 可能把便宜的二手、拆机件也当离群剔掉；调到 5~6 基本只剔除差几十倍的极端项。拿不准就留 3。"
+  },
+  "outlier_drop_percent": {
+    "type": "int",
+    "description": "离群剔除的价格闸门（占中位数的百分比）",
+    "default": 30,
+    "hint": "只有价格低于「中位数 × 这个百分比」才允许被剔除，防止把真·最低价误杀。填 30 表示比中位数便宜 70% 以上才算配件那类噪声。实测搜 9600X 时，20 条里 18 条是「CPU+主板」套装（¥1645~1899），裸 CPU 只要 ¥1049，只比中位数便宜约 42%——填 30 能保住它；填 50 会把它一起剔掉，报出来的最低价就变成 ¥1645 了。填 5 更严格（只剔差 20 倍以上的），填 100 等于关掉这道闸门。"
   },
   "check_interval_minutes": {
     "type": "int",

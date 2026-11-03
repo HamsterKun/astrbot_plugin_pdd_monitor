@@ -1,20 +1,22 @@
 # -*- coding: utf-8 -*-
 """astrbot_plugin_pdd_monitor
 
-拼多多关键词价格监控插件（H5 搜索页版）。
+拼多多关键词价格监控插件（浏览器取数版）。
 
-/盯价 add 9700X —— 以 "9700X" 为关键词抓 mobile.yangkeduo.com 搜索页，
+/盯价 add 9700X —— 以 "9700X" 为关键词搜索 mobile.yangkeduo.com，
 按价格排序后取列表里最便宜那件商品的「页面展示价」，作为该关键词的价格。
 后台定时巡检，跌破历史最低价时主动推送到已绑定的会话（群）；
 群里 @机器人 说「今日行情」，汇报所有关键词的今日价格与涨跌。
 
-取价走网页搜索页，只需要一条登录态的 cookie；不依赖开放平台资质。
-命中原生「系统繁忙 / 滑块验证」时按 1h→2h→4h→8h 指数退避，避免越撞越死。
+为什么开浏览器取数
+    搜索页已经改成客户端渲染：服务端只返回空骨架，商品由前端 XHR 拉回后解密
+    再渲染。请求要 anti_content 签名（606 字符，页面 JS 现算），响应是
+    rc-res-data 网关密文（十万字符，解密器在按需加载的 chunk 里）—— 纯 HTTP
+    复刻要逆向两套算法。所以插件开一个无头 Chromium，等它渲染完，再用注入的
+    hook 把解密后的对象取出来（见 pdd_browser.py）。
+    老路线抓 HTML 抠 window.rawData 的方式保留在 fetch_mode=http 里，仅供排查。
 
-为了降低被风控识别的概率，请求会尽量长得像一台真实手机：
-先开首页拿设备 cookie，再带 Referer 去搜索；服务端轮换的设备/风控 cookie
-会被收进会话并在下次请求带上；整轮的请求摊平到整个巡检周期里。
-装了 curl_cffi 时连 TLS 与 HTTP/2 指纹也一并模拟（transport=auto 自动启用）。
+命中原生「系统繁忙 / 滑块验证」时按 1h→2h→4h→8h 指数退避，避免越撞越死。
 """
 
 from __future__ import annotations
@@ -27,9 +29,10 @@ import random
 import re
 import statistics
 import time
+import unicodedata
 from datetime import datetime
 from typing import Any, Optional
-from urllib.parse import urlencode
+from urllib.parse import quote, unquote, urlencode, urlsplit
 
 import httpx
 
@@ -41,6 +44,14 @@ try:  # astrbot 不同版本对消息组件的导出路径保持一致，这里�
     import astrbot.api.message_components as Comp
 except Exception:  # pragma: no cover
     Comp = None  # type: ignore
+
+try:  # 浏览器取数模块。playwright 没装也能正常 import，只是用不了 browser 模式
+    from .pdd_browser import BrowserError, BrowserFetcher, BrowserUnavailable
+except ImportError:  # pragma: no cover - AstrBot 按文件加载插件时没有包上下文
+    try:
+        from pdd_browser import BrowserError, BrowserFetcher, BrowserUnavailable
+    except Exception:  # 模块缺失不该拖垮整个插件
+        BrowserError = BrowserFetcher = BrowserUnavailable = None  # type: ignore
 
 PLUGIN_NAME = "astrbot_plugin_pdd_monitor"
 DATA_FILE = "pdd_price.json"
@@ -63,20 +74,25 @@ DEFAULT_UA = (
 # 其余（api_uid、njrpl、rvds、dilx 等）是设备/风控 cookie，服务端会轮换，
 # 必须允许它们随时间演进，否则每次请求都一模一样，反而不像浏览器。
 LOGIN_COOKIE_KEYS = ("PDDAccessToken", "pdd_user_id", "pdd_user_uin")
+# 登录态之外、决定「像不像正常客户端」的几个字段。电脑端复制常常缺，
+# 手机端整条复制才全；缺了更容易被判定成异常客户端（返回空列表的降级页）。
+BASE_COOKIE_KEYS = ("api_uid", "webp", "pdd_user_id")
 
 # 判断「这个 UA 是不是 iPhone Safari」，用于决定要不要发 Safari 才有的头
 SAFARI_UA_RE = re.compile(r"Version/[\d.]+ (?:Mobile/\w+ )?Safari", re.I)
 
 
-def build_headers(ua: str, referer: Optional[str] = None) -> dict[str, str]:
+def build_headers(ua: Optional[str], referer: Optional[str] = None) -> dict[str, str]:
     """拼一套自洽的浏览器请求头。
 
     刻意不设 Accept-Encoding：交给底层库按已装的解码器决定（httpx 有 brotli 就发 br）。
     手动写死 `gzip, deflate` 而 UA 声称是 Safari，等于自报「我不是浏览器」——
     Safari 一定会发 br。
+
+    ua 传 None 时不写 User-Agent，交给 curl_cffi 的 impersonate：
+    UA 版本与 TLS/h2 指纹是配套的，自己另写一个版本号会拼出浏览器里不存在的组合。
     """
     headers = {
-        "User-Agent": ua,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "zh-CN,zh;q=0.9",
         "Upgrade-Insecure-Requests": "1",
@@ -84,9 +100,26 @@ def build_headers(ua: str, referer: Optional[str] = None) -> dict[str, str]:
         "Sec-Fetch-Mode": "navigate",
         "Sec-Fetch-Site": "same-origin" if referer else "none",
     }
+    if ua:
+        headers["User-Agent"] = ua
     if referer:
         headers["Referer"] = referer
     return headers
+
+
+def mask_proxy(url: str) -> str:
+    """代理地址脱敏：藏掉账号密码，IPv4 只留前两段。"""
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+        port = f":{parts.port}" if parts.port else ""
+        auth = f"{parts.username}:***@" if parts.username else ""
+        nums = host.split(".")
+        if len(nums) == 4 and all(n.isdigit() for n in nums):
+            host = ".".join(nums[:2] + ["*", "*"])
+        return f"{parts.scheme}://{auth}{host}{port}"
+    except Exception:
+        return "已配置"
 
 
 def parse_cookie_pairs(raw: str) -> dict[str, str]:
@@ -140,14 +173,22 @@ SORT_ASC = "price"
 SORT_DESC = "_price"
 
 # 价格字段候选：整数分优先，字符串价（带 ¥ 或千分位）兜底
+# 搜索接口（items[].item_data）用 snake_case，商品详情页的 rawData 用 camelCase，
+# 两套都收进来，靠顺序保证「拼单价」优先于「单买价」。
 PRICE_KEYS = (
     "price",
     "groupPrice",
+    "group_price",
     "minGroupPrice",
+    "min_group_price",
     "minOnSaleGroupPrice",
+    "min_on_sale_group_price",
     "priceInfo",
     "priceStr",
     "priceText",
+    # 单买价（比拼单价高）只在前面的都没有时兜底，别让它盖掉真实底价
+    "minNormalPrice",
+    "min_normal_price",
 )
 
 
@@ -260,6 +301,7 @@ def filter_price_outliers(
     k: float = 3.0,
     min_samples: int = 6,
     min_keep_ratio: float = 0.15,
+    min_drop_ratio: float = 0.3,
 ) -> tuple[list[dict], dict[str, Any]]:
     """把低价离群的商品剔掉（对数空间的中位数绝对偏差）。
 
@@ -302,7 +344,14 @@ def filter_price_outliers(
         mad = 0.01
 
     floor = math.exp(center - k * mad)
-    kept = [i for i in items if i.get("price_cents", 0) >= floor]
+    # 光靠 MAD 不够：价格挤得很紧的时候门槛会贴到中位数身上。
+    # 实测搜「9600X」的 20 条里 18 条是「CPU+主板」套装，全挤在 @1645~1899，
+    # 于是 ¥1049 的裸 CPU 反倒成了统计学上的离群值 —— 而那正是我们要的最低价。
+    # 所以再加一道比例闸门：只有「明显低于主体」才剔。配件那种 ¥3.99 对 ¥1000
+    # 差三个数量级，能拦住；¥1049 对 ¥1800 只差 0.58 倍，放过。
+    median_price = math.exp(center)
+    cutoff = min(floor, median_price * max(0.05, float(min_drop_ratio)))
+    kept = [i for i in items if i.get("price_cents", 0) >= cutoff]
     dropped = total - len(kept)
 
     if not dropped:
@@ -325,6 +374,7 @@ def filter_price_outliers(
         "outlier_kept": len(kept),
         "outlier_dropped": dropped,
         "outlier_floor": int(floor),
+        "outlier_cutoff": int(cutoff),
     }
 
 
@@ -378,11 +428,12 @@ URL_RE = re.compile(r"https?://[^\s，,、；;\"'）)】\]】]+", re.I)
 # 搜索页把整棵树塞在 window.rawData 里；匹配到等号后由 _extract_raw_data 做括号配对
 RAW_DATA_RE = re.compile(r"window\s*\.\s*rawData\s*=(?!=)")
 
-# 本插件自己发出的文案特征，用于识别平台回显、避免自问自答
+# 本插件自己发出的文案特征，用于识别平台回显、避免自问自答。
+# 所有对外文案都以 TAG 开头，所以一条就够；后面两条兼容旧版本留下的消息。
 SELF_MARKS = (
+    "【多多盯价】",
     "【今日行情】",
     "【史低提醒】",
-    "【监控列表】",
 )
 
 # 指令名刻意用中文：QQ 客户端会把「/pd」这类前缀转成表情，英文缩写容易被打断
@@ -390,17 +441,74 @@ PRIMARY_CMD = "盯价"
 CMD_ALIASES = ("多多", "拼多多", "价格监控", "比价")
 CMD_NAMES = (PRIMARY_CMD,) + CMD_ALIASES
 
-HELP_TEXT = (
-    "【多多盯价】\n"
-    "/盯价 add 9700X      加关键词开始监控\n"
-    "/盯价 del 1          删第 1 项\n"
-    "/盯价 list           监控列表\n"
-    "/盯价 info 1         单项详情\n"
-    "/盯价 check          立即巡检\n"
-    "/盯价 debug 9700X    取价诊断\n"
-    "/盯价 on / off       开 / 关本群推送\n"
-    "\n@我 说「今日行情」看全部价格。"
-)
+# 所有对外文案统一以它开头，一眼能看出是哪个插件发的
+TAG = "【多多盯价】"
+
+
+# --------------------------------------------------------------------------- #
+# 文案格式
+#
+# 统一体例：
+#   首行   【多多盯价】动作 [· 对象]
+#   正文   (标签, 值) 两列，标签按显示宽度补齐
+#   短回执 【多多盯价】动作 · 对象
+#
+# 不用「已经帮你…」「请注意…」这类句子，只留状态、数值和可执行的下一步。
+# --------------------------------------------------------------------------- #
+def dwidth(text: str) -> int:
+    """显示宽度：全角/宽字符占 2 列，半角占 1 列。对齐全靠它。"""
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+               for ch in str(text))
+
+
+def pad(text: str, width: int) -> str:
+    """按显示宽度右侧补空格。"""
+    text = str(text)
+    return text + " " * max(0, width - dwidth(text))
+
+
+def head(action: str, *extra: Any) -> str:
+    """首行：动作 + 可选的对象/状态。"""
+    line = f"{TAG}{action}"
+    tail = [str(x) for x in extra if x not in (None, "")]
+    return line + (" · " + " · ".join(tail) if tail else "")
+
+
+def rows_block(rows: list[tuple[str, str]], width: int = 8) -> str:
+    """把 (标签, 值) 排成两列。值里有换行时按同样缩进续行。"""
+    lines: list[str] = []
+    for label, value in rows:
+        value = str(value)
+        parts = value.split("\n")
+        lines.append(f"{pad(label, width)}  {parts[0]}")
+        for extra in parts[1:]:
+            lines.append(f"{' ' * width}  {extra}")
+    return "\n".join(lines)
+
+
+def split_error(msg: str) -> tuple[str, str, str]:
+    """把「现象｜原因｜处理」拆开，缺项返回空串。"""
+    parts = [p.strip() for p in str(msg or "").split("｜")]
+    parts += [""] * (3 - len(parts))
+    return parts[0], parts[1], "｜".join(p for p in parts[2:] if p)
+
+
+HELP_TEXT = "\n".join([
+    f"{TAG}指令",
+    "",
+    f"{pad('add <关键词>', 16)}添加监控",
+    f"{pad('del <序号>', 16)}删除监控项",
+    f"{pad('list', 16)}列出全部监控",
+    f"{pad('info <序号>', 16)}单项详情",
+    f"{pad('check', 16)}立即巡检一次",
+    f"{pad('reset', 16)}清除风控冷却",
+    f"{pad('debug <关键词>', 16)}取价诊断",
+    f"{pad('on | off', 16)}开 / 关本群新低推送",
+    f"{pad('help', 16)}本页",
+    "",
+    "@机器人 说「今日行情」查看全部现价。",
+])
+
 
 
 # --------------------------------------------------------------------------- #
@@ -442,9 +550,11 @@ class PddFetchError(Exception):
     与本条关键词无关，此时应立即中止本轮巡检，避免继续请求加重风控。
     """
 
-    def __init__(self, message: str = "", risk: bool = False):
+    def __init__(self, message: str = "", risk: bool = False, html: str = ""):
         super().__init__(message)
         self.risk = risk
+        # 出错时的页面原文，只给 /盯价 debug 落盘快照用，巡检路径不读它
+        self.html = html
 
 
 class PriceStore:
@@ -630,6 +740,11 @@ class PDDMonitorPlugin(Star):
         self._jar: dict[str, str] = dict(self.store.data.get("meta", {}).get("cookie_jar") or {})
         self._warmed = False
         self._last_url = ""
+        # 浏览器取数的实例，第一次用到时才启动（Chromium 起一次一两秒）
+        self._fetcher = None
+        self._fetcher_lock = asyncio.Lock()
+        self._warm_task: Optional[asyncio.Task] = None
+        self._browser_hint = ""
 
     # ---------------- 基础 ----------------
     def cfg(self, key: str, default: Any = None) -> Any:
@@ -665,6 +780,18 @@ class PDDMonitorPlugin(Star):
     def _user_agent(self) -> str:
         """UA 可配：填成你取 cookie 那台手机的同款 UA 最安全。"""
         return str(self.cfg("user_agent", "") or "").strip() or DEFAULT_UA
+
+    def _ua_header(self, curl_ok: bool) -> Optional[str]:
+        """真正写进请求头的 UA。用 curl_cffi 且用户没填时返回 None。
+
+        curl_cffi 的 impersonate 会把 UA、TLS、HTTP/2 设置作为一整套改掉；
+        我们再手写一个版本号，就成了「Safari 的指纹 + 另一个版本号的 UA」，
+        这种组合在真实浏览器里不存在，反而是破绽。
+        """
+        custom = str(self.cfg("user_agent", "") or "").strip()
+        if custom:
+            return custom
+        return None if curl_ok else DEFAULT_UA
 
     def _session_cookies(self) -> dict[str, str]:
         """配置的 cookie + 上次留存的服务端 cookie，登录态以配置为准。"""
@@ -708,9 +835,10 @@ class PDDMonitorPlugin(Star):
                         "[pdd] 配置要求 curl_cffi，但没装，回落到 httpx（TLS 指纹不会被伪装）"
                     )
                 else:
-                    logger.info(
-                        "[pdd] 未安装 curl_cffi，使用 httpx；"
-                        "pip install curl_cffi 可让 TLS 指纹也伪装成浏览器"
+                    logger.warning(
+                        "[pdd] curl_cffi 没装上（它是默认依赖），已回落 httpx，"
+                        "TLS 指纹不会被伪装；在 AstrBot 的运行环境执行 "
+                        "pip install curl_cffi 后重载插件即可"
                     )
         self._transport_choice = ok
         return ok
@@ -734,6 +862,7 @@ class PDDMonitorPlugin(Star):
             "safari15_5",
         ]
         timeout = float(self.cfg("request_timeout", 15))
+        proxy = self._proxy()
         last_err: Optional[Exception] = None
         for name in candidates:
             if not name:
@@ -741,7 +870,16 @@ class PDDMonitorPlugin(Star):
             try:
                 # Cookie 统一走请求头，不用 curl 自己的 cookie 引擎：
                 # 两条传输层用同一套 jar 逻辑，也不会因为 API 差异静默丢 cookie
-                self._curl = AsyncSession(impersonate=name, timeout=timeout)
+                kwargs = {"impersonate": name, "timeout": timeout}
+                if proxy:
+                    try:
+                        self._curl = AsyncSession(proxy=proxy, **kwargs)
+                    except TypeError:  # 老版本只认 proxies 字典
+                        self._curl = AsyncSession(
+                            proxies={"http": proxy, "https": proxy}, **kwargs
+                        )
+                else:
+                    self._curl = AsyncSession(**kwargs)
                 self._transport = f"curl_cffi/{name}"
                 logger.info(f"[pdd] 传输层：curl_cffi（模拟 {name} 的 TLS 指纹）")
                 return self._curl
@@ -752,14 +890,42 @@ class PDDMonitorPlugin(Star):
         self._transport_choice = False
         return None
 
+    def _proxy(self) -> str:
+        """出口代理。留空直连。
+
+        跑在阿里云/腾讯云这类机房时，出口 IP 属于云厂商网段，平台对这类 IP
+        的信任度明显低于家宽——典型症状就是浏览器能搜、同一份 cookie 换到
+        服务器上就返回「系统繁忙」的降级页。
+        """
+        raw = str(self.cfg("proxy", "") or "").strip()
+        if not raw:
+            return ""
+        return raw if "://" in raw else "http://" + raw
+
+    def _proxy_line(self) -> str:
+        """代理行的「值」部分（调用方自己带「代理」标签）。"""
+        proxy = self._proxy()
+        if not proxy:
+            return "未配置 · 直连，机房 IP 容易被按网段限流"
+        return mask_proxy(proxy)
+
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
             timeout = float(self.cfg("request_timeout", 15))
-            self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(timeout),
-                follow_redirects=True,
-                http2=False,
-            )
+            proxy = self._proxy()
+            kwargs = {
+                "timeout": httpx.Timeout(timeout),
+                "follow_redirects": True,
+                "http2": False,
+            }
+            try:
+                # httpx >= 0.26 用 proxy，旧版用 proxies 字典
+                self._client = httpx.AsyncClient(proxy=proxy or None, **kwargs)
+            except TypeError:
+                self._client = httpx.AsyncClient(
+                    proxies={"http://": proxy, "https://": proxy} if proxy else None,
+                    **kwargs,
+                )
             if not self._transport:
                 self._transport = "httpx"
         return self._client
@@ -804,12 +970,13 @@ class PDDMonitorPlugin(Star):
 
     async def _fetch(self, url: str, referer: Optional[str] = None) -> str:
         """真正发请求的地方。curl_cffi 与 httpx 两条路，头与 cookie 逻辑完全一致。"""
-        headers = build_headers(self._user_agent(), referer)
+        # 先定传输层，再拼头：走 curl_cffi 时 UA 交给 impersonate 自己带
+        curl = await self._get_curl() if self._use_curl() else None
+        headers = build_headers(self._ua_header(curl is not None), referer)
         jar = self._session_cookies()
         if jar:
             headers["Cookie"] = format_cookie(jar)
 
-        curl = await self._get_curl() if self._use_curl() else None
         if curl is not None:
             try:
                 resp = await curl.get(url, headers=headers)
@@ -833,7 +1000,7 @@ class PDDMonitorPlugin(Star):
         """抓页面。cookie 传 None 表示用配置里的，显式传 "" 表示故意不带。"""
         if cookie is not None:
             # 显式指定 cookie 的调用方（诊断）走一次性请求，不读也不改会话 jar
-            headers = build_headers(self._user_agent(), None)
+            headers = build_headers(self._ua_header(False), None)
             if cookie:
                 headers["Cookie"] = cookie
             client = await self._get_client()
@@ -847,6 +1014,64 @@ class PDDMonitorPlugin(Star):
 
         await self._warmup()
         return await self._fetch(url, self._last_url or None)
+
+    # ---------------- 浏览器取数 ----------------
+    def _fetch_mode(self) -> str:
+        mode = str(self.cfg("fetch_mode", "browser") or "browser").strip().lower()
+        return mode if mode in ("browser", "http", "auto") else "browser"
+
+    async def _get_fetcher(self):
+        """惰性启动浏览器实例，之后每轮复用。
+
+        Chromium 起一次要一两秒，每轮都开关会把巡检拖成分钟级；
+        但上下文（cookie + UA）每次新建，避免页面之间互相沾染。
+        """
+        if BrowserFetcher is None:
+            raise PddFetchError(
+                "找不到 pdd_browser 模块，插件文件不完整。请整目录重新上传安装。"
+            )
+        if self._fetcher is not None:
+            return self._fetcher
+
+        # 巡检和 /盯价 debug 可能撞在一起：不加锁会各起一个 Chromium，
+        # 后一个把前一个的引用顶掉，前一个的进程就再也没人关了。
+        # 单独一把锁，不能复用 self._lock —— 巡检本身就是持着它进来的。
+        async with self._fetcher_lock:
+            if self._fetcher is not None:
+                return self._fetcher
+
+            fetcher = BrowserFetcher(
+                proxy=self._proxy(),
+                cookie=self._cookie(),
+                channel=str(self.cfg("browser_channel", "") or ""),
+                headless=bool(self.cfg("browser_headless", True)),
+                timeout=float(self.cfg("browser_timeout", 45) or 45),
+                auto_install=bool(self.cfg("browser_auto_install", True)),
+                user_agent=self._user_agent(),
+                on_log=lambda m: logger.debug("[pdd] %s", m),
+            )
+            try:
+                await fetcher.start()
+            except BrowserUnavailable as e:
+                self._browser_hint = "没装 playwright"
+                raise PddFetchError(str(e)) from e
+            except Exception as e:
+                self._browser_hint = str(e)[:80]
+                raise PddFetchError(f"浏览器启动失败：{e}") from e
+            self._fetcher = fetcher
+            return fetcher
+
+    async def _browser_raw(self, keyword: str, sort: Optional[str] = None) -> dict:
+        """走浏览器取一份解密后的搜索数据。"""
+        fetcher = await self._get_fetcher()
+        sort_type = sort or str(self.cfg("search_sort", SORT_ASC) or SORT_ASC)
+        try:
+            return await fetcher.search(keyword, sort=sort_type)
+        except BrowserError as e:
+            msg = str(e)
+            # 「系统繁忙」才是真的限流，要退避；跳登录页属于配置问题，退避没用
+            risk = ("系统繁忙" in msg) or ("限流" in msg)
+            raise PddFetchError(msg, risk=risk) from e
 
     @staticmethod
     def _extract_raw_data(html: str) -> Optional[dict]:
@@ -917,11 +1142,284 @@ class PDDMonitorPlugin(Star):
         elif isinstance(data, list):
             if data and is_goods_item(data[0]):
                 return [x for x in data if isinstance(x, dict)]
+            # 列表元素是包装层时拆开。搜索接口返回的是
+            #   [{item_type: "0", item_data: {goods_model: {goods_name, price, ...}}}]
+            # 商品埋得比一层还深，所以要往下钻；只拆一层会一无所获。
+            wrapped = []
+            for x in data:
+                if not isinstance(x, dict):
+                    continue
+                hit = PDDMonitorPlugin._dig_goods(x, 3)
+                if hit is not None:
+                    wrapped.append(hit)
+            if wrapped and (len(wrapped) >= 2 or len(data) <= 2):
+                return wrapped
             for value in data:
                 found = PDDMonitorPlugin._find_goods_list(value, depth + 1)
                 if found:
                     return found
         return []
+
+    @staticmethod
+    def _dig_goods(node: Any, depth: int) -> Optional[dict]:
+        """在包装层里往下找那个真正带商品字段的 dict。
+
+        包装层的层数不固定（item_data → goods_model 已经两层），所以按特征找，
+        不按固定路径取。找到最浅的那个就返回。
+        """
+        if depth <= 0 or not isinstance(node, dict):
+            return None
+        if is_goods_item(node):
+            return node
+        for value in node.values():
+            if isinstance(value, dict):
+                hit = PDDMonitorPlugin._dig_goods(value, depth - 1)
+                if hit is not None:
+                    return hit
+        return None
+
+    @staticmethod
+    def _unwrap_goods(data: Any, depth: int = 0) -> list[dict]:
+        """兜底解析：商品被包了一层（{goods:{...}} / {item:{...}}）时拆出来。
+
+        页面改版时最省事的做法是把商品塞进一个包装字段，列表元素本身就不再
+        带 goodsName 了，这时按特征找列表会一无所获，得往里再认一层。
+        """
+        if depth > 6:
+            return []
+        if isinstance(data, dict):
+            for value in data.values():
+                if isinstance(value, list) and value and isinstance(value[0], dict):
+                    for inner_key in ("goods", "item", "product", "goodsInfo", "goods_info"):
+                        if not is_goods_item(value[0].get(inner_key)):
+                            continue
+                        out = [
+                            x[inner_key]
+                            for x in value
+                            if isinstance(x, dict) and is_goods_item(x.get(inner_key))
+                        ]
+                        if out:
+                            return out
+                elif isinstance(value, dict):
+                    found = PDDMonitorPlugin._unwrap_goods(value, depth + 1)
+                    if found:
+                        return found
+        return []
+
+    @staticmethod
+    def _list_report(
+        data: Any, path: str = "", depth: int = 0, out: Optional[list[dict]] = None
+    ) -> list[dict]:
+        """把 rawData 里所有列表的路径、长度、首条字段名收集出来，只用于诊断。
+
+        「没找到商品列表」有两种完全不同的原因：一是这个词真的搜不到东西，
+        二是页面改版、字段改名。光看错误信息分不出来，得看 rawData 里到底
+        有没有列表、列表是空的还是元素不认识。
+        """
+        if out is None:
+            out = []
+        if depth > 6 or len(out) >= 12:
+            return out
+        if isinstance(data, dict):
+            for key, value in data.items():
+                child = f"{path}.{key}" if path else str(key)
+                if value is None and str(key) in ("list", "items", "goods_list"):
+                    # null 和 [] 一样是「这个位置没数据」，诊断时要当成空列表
+                    out.append({"path": child, "size": 0, "keys": []})
+                    if len(out) >= 12:
+                        break
+                    continue
+                if isinstance(value, list):
+                    first = value[0] if value else None
+                    out.append(
+                        {
+                            "path": child,
+                            "size": len(value),
+                            "keys": sorted(map(str, first.keys()))[:8]
+                            if isinstance(first, dict)
+                            else [],
+                        }
+                    )
+                    if len(out) >= 12:
+                        break
+                elif isinstance(value, dict):
+                    PDDMonitorPlugin._list_report(value, child, depth + 1, out)
+        elif isinstance(data, list):
+            for i, value in enumerate(data[:3]):
+                if isinstance(value, dict):
+                    PDDMonitorPlugin._list_report(value, f"{path}[{i}]", depth + 1, out)
+        return out
+
+    @staticmethod
+    def _raw_hint(data: Any, depth: int = 0) -> str:
+        """把 rawData 压成一行结构摘要，例如 store{data{ssrListData{list[0]}}}。"""
+        if depth > 3 or not isinstance(data, dict):
+            return ""
+        parts = []
+        for key, value in list(data.items())[:6]:
+            if isinstance(value, dict):
+                parts.append(f"{key}{{{PDDMonitorPlugin._raw_hint(value, depth + 1)}}}")
+            elif isinstance(value, list):
+                parts.append(f"{key}[{len(value)}]")
+        return ",".join(parts)[:160]
+
+    @staticmethod
+    def _keyword_hint(keyword: str) -> str:
+        """给搜不到的长词一个能立刻试的短版本（取第一个词，通常是型号）。"""
+        parts = [p for p in re.split(r"\s+", (keyword or "").strip()) if p]
+        if len(parts) <= 1:
+            return "换个更常见的写法或同义词重试"
+        return f"只留型号重试：/盯价 debug {parts[0]}"
+
+    @staticmethod
+    def _page_title(html: str) -> str:
+        m = re.search(r"<title[^>]*>(.*?)</title>", html or "", re.I | re.S)
+        if not m:
+            return ""
+        return shorten(re.sub(r"\s+", " ", m.group(1)).strip(), 20)
+
+    @staticmethod
+    def _raw_state(html: str) -> str:
+        """rawData 取不到时，说清是哪一种取不到。
+
+        三种情况长得一样，处理办法却完全不同：
+          根本没有 rawData 字段 → 服务端给的不是搜索页（登录页/验证页）
+          rawData = null        → 页面是搜索页，但服务端把你当未登录
+          有对象但没列表         → 页面结构变了，字段路径要重新对
+        混成一句「rawData 缺失」等于什么都没说。
+        """
+        html = html or ""
+        m = RAW_DATA_RE.search(html)
+        if not m:
+            return "页面里根本没有 rawData 字段（返回的不是搜索页）"
+        pos = m.end()
+        while pos < len(html) and html[pos] in " \t\r\n=":
+            pos += 1
+        if html[pos:pos + 4].lower().startswith("null"):
+            return "rawData = null（服务端把你当未登录处理）"
+        if pos < len(html) and html[pos] == "{":
+            return "rawData 是对象但没能解析出来（页面可能被截断，或格式有变）"
+        return "rawData 的赋值不是对象（页面可能被截断）"
+
+    def _raw_missing_error(self, keyword: str, html: str) -> PddFetchError:
+        """把 rawData 缺失的三种情况，各给一条能立刻动手的建议。"""
+        state = self._raw_state(html)
+        m = RAW_DATA_RE.search(html or "")
+        if not m:
+            action = ("返回的不是搜索页，多半被跳到登录页或验证页｜"
+                      "重新复制整条 Cookie 头（11 个字段那个）再试")
+        else:
+            pos = m.end()
+            while pos < len(html) and html[pos] in " \t\r\n=":
+                pos += 1
+            if html[pos:pos + 4].lower().startswith("null"):
+                action = ("服务端没认登录态，cookie 大概已过期｜重新复制整条 Cookie 头，别只挑字段")
+            else:
+                action = ("rawData 的 JSON 没解析出来，页面可能被截断｜重试一次；"
+                          "仍如此则存 debug 快照核对结构")
+        title = self._page_title(html)
+        extra = f"（标题「{title}」）" if title else ""
+        return PddFetchError(
+            f"搜索页没有下发行情数据：{state}{extra}｜{action}",
+            risk=True,
+            html=html,
+        )
+
+    def _page_line(self, raw: Any, html: str) -> str:
+        """一行说清这页到底长什么样：几个列表、最大那个几条、HTML 多大。
+
+        「搜不到」和「页面改版」在聊天窗口里长得一样，有这个才能隔空判断。
+        """
+        size = f"{max(1, len(html) // 1024)} KB"
+        if raw is None:
+            parts = [f"rawData {self._raw_state(html)}", f"HTML {size}"]
+            title = self._page_title(html)
+            if title:
+                parts.append(f"标题「{title}」")
+            return " · ".join(parts)
+        report = self._list_report(raw)
+        if not report:
+            return f"rawData 无任何列表 · HTML {size} · {self._raw_hint(raw) or '空对象'}"
+        big = max(report, key=lambda r: r["size"])
+        return (
+            f"{len(report)} 个列表，最大 {big['size']} 条"
+            f"（{shorten(big['path'], 30)}）· HTML {size}"
+        )
+
+    def _save_snapshot(self, keyword: str, html: str) -> str:
+        """把出问题的页面存成文件，方便事后核对结构。只在 /盯价 debug 时调用。
+
+        巡检路径不调用：一天几百轮，失败几次就会堆一堆几百 KB 的文件。
+        """
+        if not html:
+            return ""
+        safe = re.sub(r"[\\/:*?\"<>|\s]+", "_", (keyword or "")).strip("_")[:40] or "page"
+        try:
+            folder = os.path.join(self._resolve_data_dir(), "debug")
+            os.makedirs(folder, exist_ok=True)
+            name = f"{safe}_{datetime.now().strftime('%m%d_%H%M%S')}.html"
+            with open(os.path.join(folder, name), "w", encoding="utf-8") as f:
+                f.write(html)
+            return name
+        except Exception as e:
+            logger.warning(f"[pdd] 页面快照写入失败：{e}")
+            return ""
+
+    def _is_curl_transport(self) -> bool:
+        """当前是否真的在模拟浏览器 TLS 指纹。"""
+        name = self._transport or ("curl_cffi" if self._use_curl() else "httpx")
+        return str(name).startswith("curl_cffi")
+
+    def _no_goods_error(self, keyword: str, raw: Any, html: str = "") -> PddFetchError:
+        """解释「为什么这页没有商品」，把 0 结果和页面改版分开说。"""
+        # 限流页有时也带 rawData，只是列表空着；先按页面文字认出来，
+        # 否则会被说成「这个词没货」，白折腾关键词
+        if html and any(w in html for w in ("系统繁忙", "访问过于频繁", "稍后再试", "异常流量")):
+            if self._is_curl_transport():
+                action = "请求过密或该分类被重点限流｜等几小时后重试"
+            else:
+                action = ("当前跑在 httpx，TLS 指纹是 Python 默认值｜"
+                          "pip install curl_cffi 后重载插件，transport 保持 auto")
+            return PddFetchError(
+                f"平台拒绝了这次搜索｜页面有「系统繁忙」但列表为空，不是关键词没货｜{action}",
+                risk=True,
+            )
+
+        report = self._list_report(raw)
+        empty = [r for r in report if r["size"] == 0]
+        filled = [r for r in report if r["size"] > 0]
+        # 搜索位（ssrListData 之类）是空的，基本就等于「这个词没货」
+        search_empty = [
+            r for r in empty if re.search(r"ssrListData|searchResult|goods", r["path"], re.I)
+        ]
+
+        if search_empty or (empty and not filled):
+            target = (search_empty or empty)[0]
+            note = ""
+            if filled:
+                note = (
+                    f"，另有 {len(filled)} 个非空列表"
+                    f"（{shorten(filled[0]['path'], 40)}）但条目不是商品"
+                )
+            return PddFetchError(
+                f"搜到 0 条商品｜{shorten(target['path'], 40)} 为空{note}｜"
+                f"{shorten(self._keyword_hint(keyword), 60)}"
+            )
+
+        if filled:
+            total = sum(r["size"] for r in filled)
+            keys = "、".join(filled[0]["keys"][:6]) or "空字段"
+            return PddFetchError(
+                f"有 {len(filled)} 个列表共 {total} 条数据，但没有一条带商品名｜"
+                f"字段名可能改了（{shorten(filled[0]['path'], 40)} 首条：{keys}）｜"
+                f"上报此条等待适配"
+            )
+
+        return PddFetchError(
+            f"页面能解析但没有任何列表｜rawData：{self._raw_hint(raw) or '空对象'}｜"
+            f"多半是 cookie 失效拿到空壳页，重新取一条 cookie"
+        )
+
 
     def _resolve_data_dir(self) -> str:
         candidates: list[str] = []
@@ -942,13 +1440,47 @@ class PDDMonitorPlugin(Star):
 
     async def initialize(self) -> None:
         self._start_worker()
+        self._warm_browser()
 
     @filter.on_astrbot_loaded()
     async def _on_loaded(self) -> None:
         # 兜底：确保定时巡检一定被启动
         self._start_worker()
 
+    def _warm_browser(self) -> None:
+        """加载插件时后台把浏览器拉起来，缺内核顺带下载。
+
+        不做这个的话，首次取数要现场等 Chromium 启动 + 下载内核（一百多 MB），
+        用户那条 /盯价 add 会卡上几分钟。放到后台，加载完就能慢慢准备好。
+        失败不打断流程：真正的错误留到取数时再报，那时能带上上下文。
+        """
+        if self._fetch_mode() != "browser":
+            return
+        if not str(self.cfg("cookie", "") or "").strip():
+            # 还没填 cookie 时预热必然失败，别在日志里刷一条没用的警告
+            return
+        if self._warm_task and not self._warm_task.done():
+            return
+
+        async def run() -> None:
+            # 让插件加载先跑完，别和 AstrBot 自己的初始化抢事件循环
+            await asyncio.sleep(3)
+            try:
+                await self._get_fetcher()
+                logger.info("[pdd] 浏览器预热完成")
+            except Exception as e:
+                logger.warning(f"[pdd] 浏览器预热失败，首次取数时会再试一次：{e}")
+
+        try:
+            self._warm_task = asyncio.create_task(run())
+        except RuntimeError:
+            # 没有运行中的事件循环（测试里直接同步调用）就跳过预热
+            self._warm_task = None
+
     async def terminate(self) -> None:
+        if self._warm_task and not self._warm_task.done():
+            self._warm_task.cancel()
+            self._warm_task = None
         if self._task and not self._task.done():
             self._task.cancel()
         if self._client and not self._client.is_closed:
@@ -959,6 +1491,13 @@ class PDDMonitorPlugin(Star):
             except Exception:
                 pass
             self._curl = None
+        # 浏览器和本地中继都要收掉，否则重新加载插件时会攒一堆进程
+        if self._fetcher is not None:
+            try:
+                await self._fetcher.close()
+            except Exception:
+                pass
+            self._fetcher = None
         # 退出前把会话 cookie 落盘，下次启动接着用同一套设备标识
         try:
             if self._jar:
@@ -1100,14 +1639,14 @@ class PDDMonitorPlugin(Star):
                 )
                 # 第 2 次起才打扰用户：偶尔一次可能只是瞬时抖动
                 if self._risk_streak == 2:
-                    notice = (
-                        "【盯价暂停】\n"
-                        f"拼多多搜索页连续限流，已冷却 {cooldown // 60} 分钟后再试。\n"
-                        "限流按账号算，频繁重试会越限越久。换网络或换账号通常能恢复。"
-                    )
+                    notice = head("巡检暂停") + "\n" + rows_block([
+                        ("原因", "搜索页连续拒绝请求"),
+                        ("冷却", f"{cooldown // 60} 分钟"),
+                        ("恢复", "/盯价 reset 立即重试"),
+                    ])
             elif ok:
                 if self._risk_streak >= 2:
-                    notice = "【盯价恢复】\n取价已恢复正常，风控计数清零。"
+                    notice = head("巡检恢复", "风控计数清零")
                 elif self._risk_streak:
                     logger.info("[pdd] 本轮取价成功，风控计数已清零")
                 self._risk_streak = 0
@@ -1123,15 +1662,27 @@ class PDDMonitorPlugin(Star):
         return (total, ok, fail, lows)
 
     # ---------------- 关键词搜索取价（H5 搜索页） ----------------
-    def _search_url(self, keyword: str, page: int = 1) -> str:
-        """拼搜索页地址。sort 取 price（升序）或 _price（降序）。"""
-        sort = str(self.cfg("search_sort", SORT_ASC) or SORT_ASC).strip()
+    def _search_url(self, keyword: str, page: int = 1, sort: Optional[str] = None) -> str:
+        """拼搜索页地址。sort 取 price（升序）或 _price（降序）。
+
+        空格必须编成 %20，不能编成 +：urlencode 默认走 quote_plus，
+        而 + 代表空格只是 application/x-www-form-urlencoded 的约定，
+        拼多多前端解 query 时按字面量处理，搜索词会变成「5070ti+ultra+w+oc」，
+        整页一条都搜不出来。浏览器地址栏发的就是 %20，这里跟浏览器对齐。
+
+        sort 显式传入时不读配置，供 /盯价 debug 做「换种排序再试一次」的对照。
+        """
+        sort = str(sort or self.cfg("search_sort", SORT_ASC) or SORT_ASC).strip()
         if sort not in (SORT_ASC, SORT_DESC):
             sort = SORT_ASC
-        query = {"search_key": keyword, "sort_type": sort, "page": str(page)}
-        return SEARCH_URL + "?" + urlencode(query)
+        # 连续空白压成一个，首尾去掉；中间的空格是「同时包含」的分词边界，要保留
+        key = re.sub(r"\s+", " ", keyword or "").strip()
+        # 参数保持最小集：实测浏览器只带 search_key 也能出商品，
+        # 多带 search_type/source 之类反而可能与真实入口不同，不画蛇添足。
+        query = {"search_key": key, "sort_type": sort, "page": str(page)}
+        return SEARCH_URL + "?" + urlencode(query, quote_via=quote)
 
-    async def _search_keyword(self, keyword: str) -> dict:
+    async def _search_keyword(self, keyword: str, sort: Optional[str] = None) -> dict:
         """按关键词搜索，返回价格最低的那件商品。
 
         取价口径：搜索页 item 里的 price（单位分），即页面展示的拼单价。
@@ -1142,27 +1693,38 @@ class PDDMonitorPlugin(Star):
         if not keyword:
             raise PddFetchError("关键词为空")
 
-        html = await self._get_html(self._search_url(keyword))
-        raw = self._extract_raw_data(html)
+        mode = self._fetch_mode()
+        html = ""
+        raw: Optional[dict] = None
 
-        if raw is None:
-            # 拿不到 rawData 时按页面特征分流，别把风控说成「没搜到」
-            if "系统繁忙" in html or "请稍后再试" in html:
-                raise PddFetchError("搜索页返回「系统繁忙」，账号被限流", risk=True)
-            if "captcha" in html or "访问验证" in html or "滑块" in html:
-                raise PddFetchError("搜索页要求验证码验证，账号被风控", risk=True)
-            raise PddFetchError(
-                "搜索页没有下发行情数据（rawData 缺失）。"
-                "可能是 cookie 失效、账号被限流，或拼多多又改了页面结构",
-                risk=True,
-            )
+        if mode == "browser":
+            raw = await self._browser_raw(keyword, sort)
+        else:
+            html = await self._get_html(self._search_url(keyword, sort=sort))
+            raw = self._extract_raw_data(html)
+            if raw is None:
+                if mode == "auto":
+                    # HTML 里没有 rawData（搜索页改成客户端渲染后就是这样），
+                    # 说明这条路已经走不通，直接改走浏览器，别拿老文案误报风控。
+                    raw = await self._browser_raw(keyword, sort)
+                    html = ""
+                elif "系统繁忙" in html or "请稍后再试" in html:
+                    raise PddFetchError("搜索页返回「系统繁忙」｜账号被限流｜等恢复或换账号",
+                                        risk=True, html=html)
+                elif "captcha" in html or "访问验证" in html or "滑块" in html:
+                    raise PddFetchError("要求验证码验证｜账号被风控｜用手机打开拼多多手动过一次验证",
+                                        risk=True, html=html)
+                else:
+                    raise self._raw_missing_error(keyword, html)
 
         goods_list = self._find_goods_list(raw)
         if not goods_list:
-            raise PddFetchError(
-                "页面结构能解析，但没找到商品列表。"
-                "可能是这个关键词确实没有结果，或拼多多改了字段名"
-            )
+            # 兜底：改版时商品常被包一层（{goods:{...}}），先拆再判「搜不到」
+            goods_list = self._unwrap_goods(raw)
+        if not goods_list:
+            err = self._no_goods_error(keyword, raw, html)
+            err.html = html
+            raise err
 
         candidates: list[dict] = []
         no_price = 0
@@ -1186,8 +1748,9 @@ class PDDMonitorPlugin(Star):
 
         if not candidates:
             raise PddFetchError(
-                f"搜到 {len(goods_list)} 件商品，但没有一件能解析出价格"
-                f"（{no_price} 件缺价格字段），拼多多可能改了价格字段名"
+                f"搜到 {len(goods_list)} 件商品，没有一件能解析出价格｜"
+                f"{no_price} 件缺价格字段，字段名可能改了｜上报此条等待适配",
+                html=html,
             )
 
         # 先按价格升序：后面「前 N 条」「该商品往后两条」都以这个顺序为准
@@ -1199,7 +1762,11 @@ class PDDMonitorPlugin(Star):
         pool = candidates
         outlier_info: dict[str, Any] = {"outlier_mode": "off", "outlier_total": len(candidates)}
         if bool(self.cfg("filter_price_outliers", True)):
-            pool, outlier_info = filter_price_outliers(candidates, k=self._outlier_k())
+            pool, outlier_info = filter_price_outliers(
+                candidates,
+                k=self._outlier_k(),
+                min_drop_ratio=self._outlier_drop_ratio(),
+            )
 
         anchor_idx = 0
         match_info: dict[str, Any] = {"match_mode": "off"}
@@ -1223,6 +1790,18 @@ class PDDMonitorPlugin(Star):
         except (TypeError, ValueError):
             k = 3.0
         return max(1.0, min(6.0, k))
+
+    def _outlier_drop_ratio(self) -> float:
+        """价格低于中位数的这个比例才允许被剔。
+
+        防止「主体全是套装、裸机反而显小」时把真·最低价剔掉。
+        配置里填的是百分比（30 = 0.3 倍）：比中位数便宜 70% 以上才算噪声。
+        """
+        try:
+            pct = float(self.cfg("outlier_drop_percent", 30))
+        except (TypeError, ValueError):
+            pct = 30.0
+        return max(0.05, min(1.0, pct / 100.0))
 
     def _title_pool_size(self) -> int:
         try:
@@ -1344,34 +1923,37 @@ class PDDMonitorPlugin(Star):
         item = self.store.goods.get(key, {})
         old_low = int(result["old_low"] or 0)
         price = int(result["price"])
-        lines = [
-            "【史低提醒】",
-            f"关键词：{item.get('keyword') or key}",
-            f"现价：{fmt_yuan(price)}",
+        rows: list[tuple[str, str]] = [
+            ("关键词", item.get("keyword") or key),
+            ("现价", fmt_yuan(price)),
         ]
         if old_low:
             drop = old_low - price
             pct = drop / old_low * 100
-            lines.append(f"原史低：{fmt_yuan(old_low)}")
-            lines.append(f"降幅：{fmt_yuan(drop)}（-{pct:.1f}%）")
+            rows.append(("原史低", fmt_yuan(old_low)))
+            rows.append(("降幅", f"{fmt_yuan(drop)}（-{pct:.1f}%）"))
         link = item.get("share_link") or (
             GOODS_URL.format(item["goods_id"]) if item.get("goods_id") else ""
         )
         if link:
-            lines.append(f"链接：{link}")
-        return "\n".join(lines)
+            rows.append(("链接", link))
+        return head("史低") + "\n" + rows_block(rows)
 
     def build_today_report(self) -> list[str]:
-        """「今日行情」文本：逐项列出关键词、现价、较昨日涨跌、史低。"""
-        now = datetime.now()
-        today = now.strftime("%Y-%m-%d")
+        """「今日行情」文本：开头汇总 + 每项一行 + 图例。
+
+        刻意不做列对齐。手机 QQ 一屏只放得下二十来个汉字，补空格对齐的表格
+        一折行就整列错位，越对齐越难读。改成一项一行、空格和 · 分隔，
+        折行只影响该项自己，不影响其它项。
+        """
+        today = datetime.now().strftime("%Y-%m-%d")
         items = list(self.store.goods.values())
 
         if not items:
-            return ["【今日行情】\n监控列表还是空的，先用 /盯价 add <关键词> 添加监控。"]
+            return [head("今日行情", "监控 0 项") + "\n\n用 /盯价 add <关键词> 添加"]
 
-        lines = ["【今日行情】", f"共监控 {len(items)} 项"]
         n_down = n_up = n_flat = n_low = n_fail = 0
+        rows: list[str] = []
 
         for idx, item in enumerate(items, 1):
             name = shorten(item.get("keyword") or "--", 16)
@@ -1380,13 +1962,14 @@ class PDDMonitorPlugin(Star):
 
             if price is None:
                 n_fail += 1
-                lines.append(f"{idx}. 「{name}」")
-                lines.append(f"　　取价失败（{shorten(item.get('last_error') or '暂无数据', 20)}）")
+                # 取价失败也把上次的史低带上：行情页看不到数，用户只能靠它判断值不值得进详情
+                tail = f" · 史低 {fmt_yuan(low)}" if low else ""
+                rows.append(f"{idx} {name} -- 取价失败{tail}")
                 continue
 
             prev_day = PriceStore._prev_day_price(item, today)
             if prev_day is None:
-                delta = "首次记录"
+                delta = "首次"
             else:
                 diff = int(price) - int(prev_day)
                 if diff < 0:
@@ -1400,18 +1983,40 @@ class PDDMonitorPlugin(Star):
             is_low = low is not None and int(price) <= int(low)
             if is_low:
                 n_low += 1
+            # 现价已经是史低时不必再报一遍史低值，标记即可；否则补上差值参照
+            if is_low:
+                tail = " ★"
+            elif low:
+                tail = f" · 史低 {fmt_yuan(low)}"
+            else:
+                tail = ""
+            rows.append(f"{idx} {name} {fmt_yuan(price)} {delta}{tail}")
 
-            lines.append(f"{idx}. 「{name}」{'【史低】' if is_low else ''}")
-            lines.append(f"　　现价 {fmt_yuan(price)} 较昨日 {delta}")
-            lines.append(f"　　史低 {fmt_yuan(low)}")
+        # 只列有变化的项：报「上涨 0」没有信息量，还占掉手机一行
+        parts = []
+        if n_down:
+            parts.append(f"下跌 {n_down}")
+        if n_up:
+            parts.append(f"上涨 {n_up}")
+        if n_flat:
+            parts.append(f"持平 {n_flat}")
+        if not parts:
+            parts.append("首次记录，暂无涨跌对比")
 
-        lines.append("————————————")
-        lines.append(f"下跌 {n_down} · 上涨 {n_up} · 持平 {n_flat}")
+        lines = [head("今日行情", f"{len(items)} 项"), "", " · ".join(parts), ""]
+        lines += rows
+        # 脚注只列需要解释的项，且每条一行 —— 堆在一行会超过手机一屏的宽度
+        foot: list[str] = []
         if n_low:
-            lines.append(f"其中 {n_low} 项正处于史低！")
+            foot.append(f"★ {n_low} 项处于史低")
         if n_fail:
-            lines.append(f"另有 {n_fail} 项取价失败")
+            foot.append(f"取价失败 {n_fail} 项 · /盯价 list 看原因")
+        if foot:
+            lines.append("")
+            lines += foot
         return self._chunk(lines)
+
+
 
     @staticmethod
     def _chunk(lines: list[str], limit: int = 900) -> list[str]:
@@ -1465,14 +2070,14 @@ class PDDMonitorPlugin(Star):
 
         if sub in ("add", "添加", "加"):
             if not arg:
-                yield event.plain_result("用法：/盯价 add <关键词>（例：/盯价 add 9700X）")
+                yield event.plain_result(head("用法", "/盯价 add <关键词>", "例 /盯价 add 9700X"))
                 return
             yield event.plain_result(await self._cmd_add(event, arg))
             return
 
         if sub in ("del", "delete", "remove", "删除"):
             if not arg:
-                yield event.plain_result("用法：/盯价 del <序号>")
+                yield event.plain_result(head("用法", "/盯价 del <序号>"))
                 return
             yield event.plain_result(self._cmd_del(arg))
             return
@@ -1489,30 +2094,37 @@ class PDDMonitorPlugin(Star):
         if sub in ("check", "检查", "巡检"):
             result = await self._check_all(notify=True)
             if result is None:
-                yield event.plain_result("上一轮巡检还没结束，稍等一会儿。")
+                yield event.plain_result(head("巡检", "上一轮未结束，跳过"))
                 return
             total, ok, fail, lows = result
             if total == 0:
-                yield event.plain_result("监控列表是空的，先 /盯价 add <关键词>。")
+                yield event.plain_result(head("巡检", "监控列表为空", "先 /盯价 add <关键词>"))
                 return
-            msg = f"巡检完成：{ok}/{total} 成功"
+            rows = [("结果", f"{ok}/{total} 成功")]
             if lows:
-                msg += f"，史低 {len(lows)} 个（已推送）"
+                rows.append(("史低", f"{len(lows)} 个 · 已推送"))
             if fail:
-                msg += f"，失败 {fail} 个"
+                rows.append(("失败", f"{fail} 个 · /盯价 list 看原因"))
             if self._last_risk:
-                msg += f"\n本轮已中止：{shorten(self._last_risk, 40)}"
+                first, _, _ = split_error(self._last_risk)
+                rows.append(("中止", shorten(first, 40)))
             if self._risk_streak:
                 wait = max(0, int(self._risk_until - time.time()))
-                msg += f"\n风控计数：连续 {self._risk_streak} 次"
-                if wait:
-                    msg += f"，冷却中，约 {max(1, wait // 60)} 分钟后再试"
-            yield event.plain_result(msg)
+                rows.append((
+                    "风控",
+                    f"连续 {self._risk_streak} 次"
+                    + (f" · 冷却中，约 {max(1, wait // 60)} 分钟后重试" if wait else ""),
+                ))
+            yield event.plain_result(head("巡检完成") + "\n" + rows_block(rows))
+            return
+
+        if sub in ("reset", "解除", "恢复"):
+            yield event.plain_result(self._cmd_reset())
             return
 
         if sub in ("debug", "诊断", "排查"):
             if not arg:
-                yield event.plain_result("用法：/盯价 debug <关键词 或 序号>")
+                yield event.plain_result(head("用法", "/盯价 debug <关键词 或 序号>"))
                 return
             yield event.plain_result(await self._cmd_debug(arg))
             return
@@ -1520,50 +2132,61 @@ class PDDMonitorPlugin(Star):
         if sub in ("on", "开启", "push"):
             changed = self.store.bind_session(event.unified_msg_origin)
             self.store.save()
-            yield event.plain_result("已开启本群新低推送。" if changed else "本群已经在推送列表里了。")
+            yield event.plain_result(
+                head("推送", "本群已开启" if changed else "本群已在列表")
+            )
             return
 
         if sub in ("off", "关闭", "unpush"):
             changed = self.store.unbind_session(event.unified_msg_origin)
             self.store.save()
-            yield event.plain_result("已关闭本群新低推送。" if changed else "本群本来就没开推送。")
+            yield event.plain_result(
+                head("推送", "本群已关闭" if changed else "本群未开启")
+            )
             return
 
-        yield event.plain_result(f"没有「{sub}」这个子指令，发 /盯价 help 看用法。")
+        yield event.plain_result(head("未知子指令", sub, "/盯价 help 查用法"))
+
 
     async def _cmd_add(self, event: AstrMessageEvent, arg: str) -> str:
         """只接受关键词；贴链接的一律引导到关键词。"""
-        head, _, note = arg.partition("|")
-        head = head.strip()
-        if not head:
-            return "用法：/盯价 add <关键词>（例：/盯价 add 9700X）"
-        if extract_first_url(head):
-            return (
-                "现在只支持关键词监控，不再盯单个链接。\n"
-                "把商品名里最有辨识度的那部分当关键词就行，例：/盯价 add 9700X"
-            )
-        return await self._add_keyword(event, head, note.strip())
+        head_part, _, note = arg.partition("|")
+        head_part = head_part.strip()
+        if not head_part:
+            return head("用法", "/盯价 add <关键词>", "例 /盯价 add 9700X")
+        if extract_first_url(head_part):
+            return "\n".join([
+                head("只支持关键词", "输入是链接"),
+                rows_block([
+                    ("说明", "不再支持盯单个商品链接"),
+                    ("改法", "/盯价 add <商品名里最有辨识度的词>"),
+                    ("示例", "/盯价 add 9700X"),
+                ]),
+            ])
+        return await self._add_keyword(event, head_part, note.strip())
 
     async def _add_keyword(self, event: AstrMessageEvent, keyword: str, note: str) -> str:
         keyword = re.sub(r"\s+", " ", keyword).strip()
         if not keyword:
-            return "关键词不能为空。"
+            return head("关键词为空")
         if len(keyword) > 40:
-            return "关键词太长了（最多 40 字）。"
+            return head("关键词超长", "上限 40 字")
 
         max_items = int(self.cfg("max_goods", 50))
         if len(self.store.goods) >= max_items:
-            return f"监控已达上限（{max_items} 项），先 /盯价 del 删几个。"
+            return head("已达上限", f"{max_items} 项", "先 /盯价 del 删除")
 
         existing = self.store.find_keyword(keyword)
         if existing:
             item = existing[1]
-            return (
-                f"这个关键词已经在监控列表里了：\n"
-                f"关键词：{item.get('keyword') or keyword}\n"
-                f"当前最低价：{fmt_yuan(item.get('last_price_cents'))}\n"
-                f"历史最低：{fmt_yuan(item.get('lowest_cents'))}"
-            )
+            return "\n".join([
+                head("已在监控"),
+                rows_block([
+                    ("关键词", item.get("keyword") or keyword),
+                    ("现价", fmt_yuan(item.get("last_price_cents"))),
+                    ("史低", fmt_yuan(item.get("lowest_cents"))),
+                ]),
+            ])
 
         best: Optional[dict] = None
         err = ""
@@ -1588,24 +2211,32 @@ class PDDMonitorPlugin(Star):
         self.store.bind_session(event.unified_msg_origin)
         self.store.save()
 
-        lines = ["已加入监控：", f"关键词：{keyword}"]
+        rows: list[tuple[str, str]] = [("关键词", keyword)]
         if note:
-            lines.append(f"备注：{note}")
-        if not best:
-            tip = shorten(err or "搜索页未返回有效数据", 24)
-            lines.append("当前最低价：--")
-            lines.append(f"提示：本次没取到价格（{tip}），后续巡检会继续尝试。")
-            return "\n".join(lines)
+            rows.append(("备注", note))
 
-        lines.append(f"当前最低价：{fmt_yuan(item.get('last_price_cents'))}")
-        lines.append(f"历史最低：{fmt_yuan(item.get('lowest_cents'))}（首次记录）")
+        if not best:
+            first, reason, action = split_error(err or "取价失败")
+            rows.append(("现价", "--"))
+            rows.append(("原因", first or "取价失败"))
+            if reason:
+                rows.append(("说明", reason))
+            if action:
+                rows.append(("处理", action))
+            rows.append(("后续", "巡检会继续尝试"))
+            return head("已添加", "本次未取到价") + "\n" + rows_block(rows)
+
+        rows.append(("现价", fmt_yuan(item.get("last_price_cents"))))
+        rows.append(("史低", fmt_yuan(item.get("lowest_cents")) + " · 首次记录"))
         # 次低：只报价格，不报标题，避免消息过长
         others = [s for s in (best.get("samples") or [])[1:3] if s.get("price_cents")]
         if others:
-            lines.append("次低：" + "、".join(fmt_yuan(s["price_cents"]) for s in others))
+            rows.append(("次低", "、".join(fmt_yuan(s["price_cents"]) for s in others)))
+        if item.get("goods_id"):
+            rows.append(("商品", item["goods_id"]))
         if item.get("share_link"):
-            lines.append(f"链接：{item['share_link']}")
-        return "\n".join(lines)
+            rows.append(("链接", item["share_link"]))
+        return head("已添加") + "\n" + rows_block(rows)
 
     def _cmd_del(self, arg: str) -> str:
         target = arg.strip().lstrip("#")
@@ -1621,37 +2252,37 @@ class PDDMonitorPlugin(Star):
                 key = found[0]
 
         if not key:
-            return f"没找到「{target}」，发 /盯价 list 看序号。"
+            return head("未找到", target, "/盯价 list 查序号")
 
         label = str(self.store.goods[key].get("keyword") or key)
         self.store.remove(key)
         self.store.save()
-        return f"已删除「{label}」"
+        return head("已删除", label)
 
     def _cmd_list(self) -> list[str]:
         items = list(self.store.goods.items())
         if not items:
-            return ["【监控列表】\n监控列表还是空的，先用 /盯价 add <关键词> 添加监控。"]
+            return [head("列表", "监控 0 项") + "\n\n用 /盯价 add <关键词> 添加"]
 
-        lines = ["【监控列表】", f"共监控 {len(items)} 项"]
+        # 与行情同一套排版：一项一行、不补列宽。手机端折行只影响该项自己，不会整列错位。
+        rows = [head("列表", f"{len(items)} 项"), ""]
         for idx, (_key, item) in enumerate(items, 1):
             name = shorten(item.get("keyword") or "--", 16)
-            price = item.get("last_price_cents")
-            lines.append(f"{idx}. 「{name}」")
-            if price is None:
-                lines.append(f"　　现价 --　史低 {fmt_yuan(item.get('lowest_cents'))}")
-            else:
-                lines.append(
-                    f"　　现价 {fmt_yuan(price)}　史低 {fmt_yuan(item.get('lowest_cents'))}"
-                )
-        lines.append("————————————")
-        lines.append(f"推送会话：{len(self.store.data.get('sessions') or [])} 个")
-        return lines
+            price = fmt_yuan(item.get("last_price_cents"))
+            low = fmt_yuan(item.get("lowest_cents"))
+            rows.append(f"{idx} {name} 现价 {price} · 史低 {low}")
+        rows.append("")
+        rows.append("/盯价 info <序号> 看单项详情")
+        sessions = len(self.store.data.get("sessions") or [])
+        if sessions:
+            # 单独一行：跟 info 提示并排放会超过手机一屏的宽度
+            rows.append(f"推送至 {sessions} 个会话")
+        return rows
 
     def _cmd_info(self, arg: str) -> str:
         target = arg.strip()
         if not target:
-            return "用法：/盯价 info <序号>"
+            return head("用法", "/盯价 info <序号>")
         key: Optional[str] = None
         if target.isdigit() and len(target) <= 3:
             found = self.store.get_by_index(int(target))
@@ -1662,48 +2293,97 @@ class PDDMonitorPlugin(Star):
             if found:
                 key = found[0]
         if not key:
-            return f"没找到「{target}」，发 /盯价 list 看序号。"
+            return head("未找到", target, "/盯价 list 查序号")
 
         item = self.store.goods[key]
         daily = item.get("daily") or {}
         recent = sorted(daily.items())[-7:]
         trend = "、".join(f"{d[5:]} {fmt_yuan(c)}" for d, c in recent) or "--"
 
-        lines = [
-            "【监控详情】",
-            f"关键词：{item.get('keyword') or key}",
-            f"现价：{fmt_yuan(item.get('last_price_cents'))}",
-            f"历史最低：{fmt_yuan(item.get('lowest_cents'))}"
-            f"（{str(item.get('lowest_at') or '--')[:16]}）",
+        low_at = str(item.get("lowest_at") or "").strip()[:16]
+        rows: list[tuple[str, str]] = [
+            ("关键词", item.get("keyword") or key),
+            ("现价", fmt_yuan(item.get("last_price_cents"))),
+            ("史低", fmt_yuan(item.get("lowest_cents")) + (f" · {low_at}" if low_at else "")),
         ]
         if item.get("note"):
-            lines.append(f"备注：{item['note']}")
+            rows.append(("备注", item["note"]))
         if item.get("title"):
-            lines.append(f"最低价商品：{shorten(item['title'], 24)}")
-        lines.append(f"最近记录：{trend}")
+            rows.append(("最低商品", shorten(item["title"], 24)))
+        if item.get("goods_id"):
+            rows.append(("商品", str(item["goods_id"])))
+        rows.append(("近 7 天", trend))
         if item.get("last_error"):
-            lines.append(f"最近错误：{shorten(item['last_error'], 40)}")
+            # 错误统一成「现象｜原因｜处理」，这里只留现象，避免详情页过长
+            rows.append(("上次失败", shorten(split_error(item["last_error"])[0], 40)))
         if item.get("share_link"):
-            lines.append(f"链接：{item['share_link']}")
-        return "\n".join(lines)
+            rows.append(("链接", item["share_link"]))
+        return head("详情") + "\n" + rows_block(rows)
 
-    def _cookie_line(self) -> str:
-        """只报 cookie 的长度和关键字段是否齐全，绝不回显内容。"""
+
+    def _cookie_rows(self) -> list[tuple[str, str]]:
+        """只报 cookie 的长度、字段数和关键字段是否齐全，绝不回显内容。"""
         raw = str(self.cfg("cookie", "") or "").strip()
         if not raw:
-            return "cookie：未配置（必填，否则搜索页只下发空壳）"
+            return [("cookie", "未配置 · 必填，否则搜索页只下发空壳")]
         jar = normalize_cookie(raw)
-        parts = [f"{len(jar)} 字符"]
-        parts.append("含 PDDAccessToken" if "PDDAccessToken" in jar else "缺 PDDAccessToken")
-        if "pdd_user_id" in jar:
-            parts.append("含 pdd_user_id")
-        line = "cookie：" + "、".join(parts)
+        pairs = parse_cookie_pairs(jar)
+        has_token = "PDDAccessToken" in pairs
+        rows = [(
+            "cookie",
+            f"{len(jar)} 字符 · {len(pairs)} 个字段 · "
+            + ("含 PDDAccessToken" if has_token else "缺 PDDAccessToken"),
+        )]
+        # 这几个字段从电脑端复制常常没有，手机端整条复制才全；缺了容易被判成异常客户端
+        missing = [k for k in BASE_COOKIE_KEYS if k not in pairs and k not in self._jar]
+        if missing:
+            rows.append(("缺失字段", f"{'、'.join(missing)} · 从手机浏览器整条重取更全"))
         if self._jar:
-            line += f"\n会话：已沿用 {len(self._jar)} 个服务端下发的设备 cookie"
-        return line
+            rows.append(("会话", f"沿用 {len(self._jar)} 个服务端下发的设备 cookie"))
+        return rows
 
-    def _transport_line(self) -> str:
-        """报当前伪装到了哪一层——这决定了被风控检测的概率。"""
+    def _fetcher_alive(self) -> bool:
+        """浏览器实例的进程还活着吗（实例存在不等于进程在）。"""
+        if self._fetcher is None:
+            return False
+        browser = getattr(self._fetcher, "_browser", None)
+        if browser is None:
+            return False
+        try:
+            return bool(browser.is_connected())
+        except Exception:
+            return False
+
+    def _kernel_note(self) -> str:
+        """内核状态：自动下载过的话要说一声，否则用户不知道那一百多 MB 哪来的。"""
+        state = str(getattr(self._fetcher, "kernel_state", "") or "")
+        if state == "installed":
+            return " · 已自动补装内核"
+        if state == "installing":
+            return " · 内核下载中"
+        return ""
+
+    def _transport_rows(self) -> list[tuple[str, str]]:
+        """报当前取数与伪装方式——这决定了被风控检测的概率。"""
+        mode = self._fetch_mode()
+        custom = str(self.cfg("user_agent", "") or "").strip()
+
+        if mode == "browser":
+            kernel = str(self.cfg("browser_channel", "") or "").strip() or "chrome-headless-shell"
+            if self._fetcher is None:
+                state = "未启动，首次取数时拉起"
+            elif self._fetcher_alive():
+                state = "已启动"
+            else:
+                # 实例在、进程死了也是有的（被系统杀掉），报「已启动」会误导人
+                state = "进程已退出，下次取数时自动重启"
+            return [
+                ("取数", f"浏览器 · {kernel}（{state}）{self._kernel_note()}"),
+                ("UA", "自定义" if custom else "内置 iPhone Safari"),
+                ("指纹", "TLS/HTTP2 由 Chromium 生成 · curl_cffi 不参与"),
+                ("代理", self._proxy_line()),
+            ]
+
         if self._transport:
             name = self._transport
         elif self._use_curl():
@@ -1713,10 +2393,55 @@ class PDDMonitorPlugin(Star):
         if name.startswith("curl_cffi"):
             layer = "TLS + HTTP2 指纹已模拟"
         else:
-            layer = "仅伪造请求头，TLS 指纹仍是 Python 默认值"
-        ua = self._user_agent()
-        ua_kind = "默认" if ua == DEFAULT_UA else "自定义"
-        return f"传输：{name}（{layer}）\nUA：{ua_kind}、{'iPhone Safari' if SAFARI_UA_RE.search(ua) else '非 Safari 系'}"
+            layer = "仅伪造请求头，TLS 指纹仍是 Python 默认值 · curl_cffi 未生效"
+        if custom:
+            ua = f"自定义 · {'iPhone Safari' if SAFARI_UA_RE.search(custom) else '非 Safari 系'}"
+        elif name.startswith("curl_cffi"):
+            ua = "跟随 curl_cffi 指纹（与 TLS 版本配套）"
+        else:
+            ua = f"默认 · {'iPhone Safari' if SAFARI_UA_RE.search(DEFAULT_UA) else '非 Safari 系'}"
+        return [
+            ("取数", f"{name}（{layer}）"),
+            ("UA", ua),
+            ("代理", self._proxy_line()),
+        ]
+
+    # 兼容旧调用：测试和日志里还在按整段字符串取
+    def _cookie_line(self) -> str:
+        return rows_block(self._cookie_rows())
+
+    def _transport_line(self) -> str:
+        return rows_block(self._transport_rows())
+
+
+    def _cmd_reset(self) -> str:
+        """清掉风控冷却与连续失败计数。
+
+        换完 cookie、装完 curl_cffi 之后要能立刻重试，否则得干等退避时间，
+        会让人以为插件坏了。
+        """
+        had_streak = self._risk_streak
+        self._risk_streak = 0
+        self._risk_until = 0.0
+        self._last_risk = ""
+        meta = self.store.data.setdefault("meta", {})
+        meta["risk_streak"] = 0
+        cleared = 0
+        for item in self.store.goods.values():
+            if item.get("fail_count") or item.get("last_error"):
+                item["fail_count"] = 0
+                item["last_error"] = ""
+                cleared += 1
+        self.store.save()
+
+        rows: list[tuple[str, str]] = []
+        if had_streak:
+            rows.append(("风控计数", f"{had_streak} → 0"))
+        if cleared:
+            rows.append(("失败计数", f"清掉 {cleared} 项"))
+        rows.append(("下一步", "/盯价 debug <关键词> 验证，再 /盯价 check"))
+        return head("冷却已清除") + "\n" + rows_block(rows)
+
 
     async def _cmd_debug(self, arg: str) -> str:
         target = arg.strip()
@@ -1726,65 +2451,108 @@ class PDDMonitorPlugin(Star):
                 target = str(found[1].get("keyword") or target)
         return await self._debug_keyword(target)
 
-    def _match_line(self, best: dict) -> str:
+    def _match_row(self, best: dict) -> tuple[str, str]:
         """把标题匹配过程讲清楚：取了几条、选了第几条、重合多少、命中了哪些词。"""
         mode = str(best.get("match_mode") or "off")
         if mode == "off":
-            return "匹配：未启用标题过滤（按最低价取）"
+            return ("匹配", "未启用标题过滤 · 按最低价取")
         if mode == "fallback":
-            return f"匹配：{best.get('match_note') or '未命中，按最低价取'}"
+            return ("匹配", best.get("match_note") or "未命中，按最低价取")
 
         pool = best.get("match_pool") or 0
         idx = best.get("match_index") or 1
         score = best.get("match_score")
         pct = f"{score * 100:.0f}%" if isinstance(score, (int, float)) else "--"
-        line = f"匹配：前 {pool} 条里第 {idx} 条 · 重合 {pct}"
+        text = f"前 {pool} 条里第 {idx} 条 · 重合 {pct}"
         tokens = best.get("match_tokens") or []
         if tokens:
             shown = "、".join(str(t) for t in tokens[:4])
-            line += f"（命中 {shown}）"
+            text += f"（命中 {shown}）"
         if best.get("match_penalized"):
-            line += " · 含配件词已降权"
+            text += " · 含配件词已降权"
         if mode == "substring":
-            line += " · 子串匹配"
-        return line
+            text += " · 子串匹配"
+        return ("匹配", text)
 
-    def _outlier_line(self, best: dict) -> str:
-        """说明价格离群剔除的结果。"""
+    def _outlier_row(self, best: dict) -> tuple[str, str]:
+        """说明价格离群剔除的结果。
+
+        阈值取的是「MAD 下限」和「中位数百分比闸门」里更小的那个 ——
+        实际生效的往往是闸门，所以按它显示，免得看到的数字和剔掉的对不上。
+        """
         mode = str(best.get("outlier_mode") or "off")
         total = best.get("outlier_total") or 0
         if mode == "off":
-            return "过滤：未启用价格离群剔除"
+            return ("过滤", "未启用价格离群剔除")
         if mode == "skip":
-            return f"过滤：{best.get('outlier_note') or '未做剔除'}（共 {total} 条）"
+            return ("过滤", f"{best.get('outlier_note') or '未做剔除'} · 共 {total} 条")
         kept = best.get("outlier_kept") or 0
         dropped = best.get("outlier_dropped") or 0
-        floor = fmt_yuan(best.get("outlier_floor"))
-        return f"过滤：剔除 {dropped} 条低价离群，保留 {kept}/{total} 条（下限 {floor}）"
+        cutoff = best.get("outlier_cutoff") or best.get("outlier_floor")
+        text = (f"剔除 {dropped} 条低价离群 · 保留 {kept}/{total}"
+                f" · 下限 {fmt_yuan(cutoff)}")
+        floor = best.get("outlier_floor")
+        if cutoff and floor and int(cutoff) < int(floor):
+            text += f" · 比例闸门 {self._outlier_drop_ratio():.0%} 生效"
+        return ("过滤", text)
 
     async def _debug_keyword(self, keyword: str) -> str:
         keyword = (keyword or "").strip()
         if not keyword:
-            return "用法：/盯价 debug <关键词>"
+            return head("用法", "/盯价 debug <关键词 或 序号>")
         sort = str(self.cfg("search_sort", SORT_ASC) or SORT_ASC).strip() or SORT_ASC
+        if sort not in (SORT_ASC, SORT_DESC):
+            sort = SORT_ASC
         try:
             best = await self._search_keyword(keyword)
         except Exception as e:
-            return (
-                f"「{keyword}」搜索失败\n{shorten(str(e), 60)}\n"
-                f"{self._cookie_line()}\n{self._transport_line()}"
-            )
-        lines = [f"「{keyword}」搜到 {best.get('scanned') or best.get('count', 0)} 条"]
-        lines.append(self._outlier_line(best))
-        lines.append(f"当前最低：{fmt_yuan(best['price_cents'])}")
-        lines.append(f"　{shorten(best.get('title') or '', 24)}")
+            page_html = getattr(e, "html", "") or ""
+            first, reason, action = split_error(str(e))
+            rows: list[tuple[str, str]] = [("现象", shorten(first, 120))]
+            if reason:
+                rows.append(("原因", shorten(reason, 120)))
+            if action:
+                rows.append(("处理", shorten(action, 120)))
+            rows.append(("请求", shorten(unquote(self._search_url(keyword)), 100)))
+            if page_html:
+                rows.append(("页面", self._page_line(self._extract_raw_data(page_html), page_html)))
+            rows += self._cookie_rows()
+            # 再换一种排序试一次：能区分「排序参数不灵」和「这个词真没货」，
+            # 限流时不做，避免火上浇油
+            if not getattr(e, "risk", False):
+                alt = SORT_DESC if sort == SORT_ASC else SORT_ASC
+                alt_name = "降序" if alt == SORT_DESC else "升序"
+                try:
+                    alt_best = await self._search_keyword(keyword, sort=alt)
+                except Exception:
+                    rows.append(("对照", f"换{alt_name}也是 0 条 → 不是排序问题，是这个词没货"))
+                else:
+                    rows.append((
+                        "对照",
+                        f"换{alt_name}能搜到 {alt_best.get('scanned') or 0} 条、"
+                        f"最低 {fmt_yuan(alt_best.get('price_cents'))} → 问题在"
+                        f"{'升序' if sort == SORT_ASC else '降序'}排序，改 search_sort 即可",
+                    ))
+            snapshot = self._save_snapshot(keyword, page_html)
+            if snapshot:
+                rows.append(("快照", f"debug/{snapshot}"))
+            rows += self._transport_rows()
+            return head("诊断失败", keyword) + "\n" + rows_block(rows)
+
+        rows = [
+            ("命中", f"{best.get('scanned') or best.get('count', 0)} 条"),
+            self._outlier_row(best),
+            ("最低", fmt_yuan(best["price_cents"])),
+            ("商品", shorten(best.get("title") or "", 24)),
+        ]
         if best.get("goods_id"):
-            lines.append(f"　商品 {best['goods_id']}")
-        lines.append(self._match_line(best))
-        lines.append(f"排序：{sort}（{ '升序' if sort == SORT_ASC else '降序'}）")
-        lines.append(self._cookie_line())
-        lines.append(self._transport_line())
-        return "\n".join(lines)
+            rows.append(("编号", str(best["goods_id"])))
+        rows.append(self._match_row(best))
+        rows.append(("排序", f"{sort}（{'升序' if sort == SORT_ASC else '降序'}）"))
+        rows += self._cookie_rows()
+        rows += self._transport_rows()
+        return head("诊断", keyword) + "\n" + rows_block(rows)
+
 
     # ---------------- 关键词：今日行情 ----------------
     @filter.event_message_type(filter.EventMessageType.ALL)

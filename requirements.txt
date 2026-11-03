@@ -1,2 +1,7 @@
 httpx>=0.24.0
 jieba>=0.42.1
+# 伪装 TLS / HTTP2 指纹：只在 fetch_mode=http 时用到（老路线，现在基本取不到价）
+curl_cffi>=0.7.0
+# 浏览器取数：搜索页改成客户端渲染后，只有真浏览器能拿到商品数据
+# pip 装完还要再下载内核：python -m playwright install chromium
+playwright>=1.40.0
