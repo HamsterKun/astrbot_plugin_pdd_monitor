@@ -171,6 +171,22 @@ def parse_set_cookie(values: list[str]) -> dict[str, str]:
 # 所以默认用升序。真要倒序，把配置 search_sort 改成 _price。
 SORT_ASC = "price"
 SORT_DESC = "_price"
+# 综合排序：不带 sort_type。拼多多自己的推荐排序，相关性权重高，
+# 拿它当价格基准比拿升序页靠谱得多（升序页会被最便宜的一批占满）。
+SORT_DEFAULT = ""
+
+# 基准价缓存时长：基准只看「这个型号大致多少钱」，半天内的漂移可以忽略。
+# 缓存住它，稳态下巡检仍然是每个关键词一次请求，只有过期那一轮才多打一次。
+BASELINE_TTL = 6 * 3600
+# 基准下沿占中位数的百分比：低于这个比例视为「不是同一档商品」。
+# 取 60 而不是更严：升序页本来就该比基准页便宜一截，卡到七成会把正常促销剔掉。
+# 真正区分近似型号靠型号整串校验（见 model_must_match），这道只拦配件、引流 SKU。
+DEFAULT_BASELINE_FLOOR_PCT = 60
+
+# 型号词：3~5 位数字 + 可选字母后缀，如 5070ti、9700x、4060。
+# 不取小写字母前缀：卖家写「RTX5070Ti」也常写「5070Ti 显卡」，带上前缀就比不中。
+# 两侧不吃紧邻数字，免得「5070」匹配到「50700mAh」这种规格。
+MODEL_TOKEN_RE = re.compile(r"(?<!\d)\d{3,5}[a-z]{0,3}(?!\d)", re.I)
 
 # 价格字段候选：整数分优先，字符串价（带 ¥ 或千分位）兜底
 # 搜索接口（items[].item_data）用 snake_case，商品详情页的 rawData 用 camelCase，
@@ -271,6 +287,27 @@ def overlap_score(keyword_tokens: set[str], title_tokens: set[str]) -> tuple[flo
     return len(hit) / len(keyword_tokens), hit
 
 
+def model_key(keyword: str) -> str:
+    """取出关键词里的型号词，有多段取最长的。
+
+    「5070ti」整段是型号，「5070」只是它的一半；取最长的那个才分得开。
+    只认 3 位以上数字的串，避免把 16g、d5 这类规格当成型号去硬卡。
+    """
+    hits = [m.group(0).lower() for m in MODEL_TOKEN_RE.finditer(keyword or "")]
+    if not hits:
+        return ""
+    return max(hits, key=len)
+
+
+def squash(text: str) -> str:
+    """抹平空格与分隔符、统一小写，只用于型号整串比对。
+
+    卖家写「RTX 5070 Ti」「5070ti」「5070-TI」是同一个型号，
+    保留空格就没法比；中文括号与顿号也一并去掉。
+    """
+    return re.sub(r"[\s\-_/.+·、,，()（）\[\]【】]+", "", (text or "").lower())
+
+
 # 配件/引流词：标题里出现、而关键词里没有时，说明这条不是完整商品。
 # 「选配」是拼多多常见的引流 SKU（一个链接挂多个型号，标的是最低配的价格），
 # 它价格低、标题又含型号，是短关键词下最容易误选的一类。
@@ -296,6 +333,52 @@ def accessory_penalty(title: str, keyword_tokens: set[str]) -> float:
 # --------------------------------------------------------------------------- #
 # 价格离群剔除
 # --------------------------------------------------------------------------- #
+def price_band(
+    items: list[dict],
+    k: float = 3.0,
+    min_drop_ratio: float = 0.3,
+) -> dict[str, Any]:
+    """算一组商品的价格带：中位数与可接受下沿（分）。
+
+    单独抽出来是因为它有两个用处：
+    - 同一批结果内部剔除配件、引流 SKU（filter_price_outliers）
+    - 拿综合排序那批「推荐算法筛过的真实商品」当尺子，去校准价格升序那批
+      （升序页会被最便宜的一批占满，本身没有可比样本）
+
+    返回 mode：
+    - `ok`  算出下沿，cutoff 有值
+    - `thin` 样本太少或价格没有区分度，cutoff 为 0，调用方不该据此过滤
+    """
+    total = len(items)
+    if total < 6:
+        return {"mode": "thin", "total": total, "cutoff": 0, "median": 0,
+                "floor": 0, "note": f"仅 {total} 条，样本太少"}
+
+    logs = [math.log(max(1, int(i.get("price_cents") or 1))) for i in items]
+    center = statistics.median(logs)
+    mad = statistics.median([abs(x - center) for x in logs])
+    if mad <= 1e-9:
+        # 价格几乎完全一致（或绝大多数一致），给一个极小的尺度兜底。
+        # 这时阈值贴着中位数，下限几乎等于中位数本身，不会误剔任何一侧。
+        mad = 0.01
+
+    floor = math.exp(center - k * mad)
+    median_price = math.exp(center)
+    # 光靠 MAD 不够：价格挤得很紧的时候门槛会贴到中位数身上。
+    # 实测搜「9600X」的 20 条里 18 条是「CPU+主板」套装，全挤在 @1645~1899，
+    # 于是 ¥1049 的裸 CPU 反倒成了统计学上的离群值 —— 而那正是我们要的最低价。
+    # 所以再加一道比例闸门：只有「明显低于主体」才剔。配件那种 ¥3.99 对 ¥1000
+    # 差三个数量级，能拦住；¥1049 对 ¥1800 只差 0.58 倍，放过。
+    cutoff = min(floor, median_price * max(0.05, float(min_drop_ratio)))
+    return {
+        "mode": "ok",
+        "total": total,
+        "median": int(round(median_price)),
+        "floor": int(round(floor)),
+        "cutoff": int(round(cutoff)),
+    }
+
+
 def filter_price_outliers(
     items: list[dict],
     k: float = 3.0,
@@ -328,29 +411,14 @@ def filter_price_outliers(
     if not items:
         return items, {"outlier_mode": "off", "outlier_total": 0}
 
-    if len(items) < min_samples:
+    band = price_band(items, k=k, min_drop_ratio=min_drop_ratio)
+    if band["mode"] != "ok":
         return items, {
             "outlier_mode": "skip",
             "outlier_total": total,
-            "outlier_note": f"仅 {total} 条，样本太少不做剔除",
+            "outlier_note": f"{band.get('note') or '样本不足'}，不做剔除",
         }
-
-    logs = [math.log(max(1, int(i.get("price_cents") or 1))) for i in items]
-    center = statistics.median(logs)
-    mad = statistics.median([abs(x - center) for x in logs])
-    if mad <= 1e-9:
-        # 价格几乎完全一致（或绝大多数一致），给一个极小的尺度兜底。
-        # 这时阈值贴着中位数，下限几乎等于中位数本身，不会误剔任何一侧。
-        mad = 0.01
-
-    floor = math.exp(center - k * mad)
-    # 光靠 MAD 不够：价格挤得很紧的时候门槛会贴到中位数身上。
-    # 实测搜「9600X」的 20 条里 18 条是「CPU+主板」套装，全挤在 @1645~1899，
-    # 于是 ¥1049 的裸 CPU 反倒成了统计学上的离群值 —— 而那正是我们要的最低价。
-    # 所以再加一道比例闸门：只有「明显低于主体」才剔。配件那种 ¥3.99 对 ¥1000
-    # 差三个数量级，能拦住；¥1049 对 ¥1800 只差 0.58 倍，放过。
-    median_price = math.exp(center)
-    cutoff = min(floor, median_price * max(0.05, float(min_drop_ratio)))
+    cutoff = band["cutoff"]
     kept = [i for i in items if i.get("price_cents", 0) >= cutoff]
     dropped = total - len(kept)
 
@@ -373,8 +441,8 @@ def filter_price_outliers(
         "outlier_total": total,
         "outlier_kept": len(kept),
         "outlier_dropped": dropped,
-        "outlier_floor": int(floor),
-        "outlier_cutoff": int(cutoff),
+        "outlier_floor": band["floor"],
+        "outlier_cutoff": cutoff,
     }
 
 
@@ -523,6 +591,18 @@ def fmt_yuan(cents: Optional[int]) -> str:
 def shorten(text: str, limit: int = 28) -> str:
     text = (text or "").strip().replace("\n", " ")
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _ago_text(ts: float) -> str:
+    """「多久以前」，只到分钟/小时，诊断里不需要更细。"""
+    if not ts:
+        return "未知"
+    secs = max(0, int(time.time() - float(ts)))
+    if secs < 60:
+        return "刚刚"
+    if secs < 3600:
+        return f"{secs // 60} 分钟前"
+    return f"{secs // 3600} 小时前"
 
 
 def now_str() -> str:
@@ -723,6 +803,7 @@ class PDDMonitorPlugin(Star):
     def __init__(self, context: Context, config: Optional[AstrBotConfig] = None):
         super().__init__(context)
         self.config = config or {}
+        self._migrate_flat_config()
         self.store = PriceStore(os.path.join(self._resolve_data_dir(), DATA_FILE))
         self._task: Optional[asyncio.Task] = None
         self._client: Optional[httpx.AsyncClient] = None
@@ -748,11 +829,61 @@ class PDDMonitorPlugin(Star):
 
     # ---------------- 基础 ----------------
     def cfg(self, key: str, default: Any = None) -> Any:
+        """读配置。顶层没有就翻到分区里找。
+
+        配置项按用途收进了几组 type=object 的嵌套对象（见 _conf_schema.json），
+        读取方不该关心某项被放进了哪一组，所以这里统一兜住，调用处一律 cfg("名字")。
+        """
         try:
-            value = self.config.get(key, default)
+            value = self._dig(self.config, key)
         except Exception:
             return default
         return default if value is None else value
+
+    def _dig(self, node: Any, key: str) -> Any:
+        """在配置里找 key：先看本层，再逐层往下。
+
+        先本层再下钻，是为了让「顶层还留着旧键」时以顶层为准——迁移没落盘
+        （AstrBot 只补默认值、不删旧键）也不至于读到另一份值。
+        """
+        if not isinstance(node, dict):
+            return None
+        if key in node:
+            return node[key]
+        for value in node.values():
+            if isinstance(value, dict):
+                got = self._dig(value, key)
+                if got is not None:
+                    return got
+        return None
+
+    def _cfg_groups(self) -> list[dict]:
+        """配置里的分区：schema 中用 type=object 包起来的那几组。"""
+        try:
+            return [v for v in list(self.config.values()) if isinstance(v, dict)]
+        except Exception:
+            return []
+
+    def _migrate_flat_config(self) -> None:
+        """把旧的平铺配置搬进分区。
+
+        AstrBot 升级插件时只按 schema 递归补全缺的默认值，不会删掉配置文件里
+        多余的旧键。若不搬：页面上改的是分组里的值，程序读到的却是顶层那份旧的，
+        表现为「改了没反应」。启动时搬一次并落盘，之后就只剩分组这一份。
+        """
+        moved = 0
+        for group in self._cfg_groups():
+            for key in [k for k in group if k in self.config]:
+                group[key] = self.config.pop(key)
+                moved += 1
+        if not moved:
+            return
+        save = getattr(self.config, "save_config", None)
+        if callable(save):
+            try:
+                save()
+            except Exception as e:  # 存不下不影响本次运行，下次启动会再搬一次
+                logger.warning(f"[pdd] 配置迁移后保存失败：{e}")
 
     def _risk_cooldown(self, streak: int) -> int:
         """风控冷却时长（秒）：1h、2h、4h… 到上限封顶。
@@ -1095,9 +1226,16 @@ class PDDMonitorPlugin(Star):
             return fetcher
 
     async def _browser_raw(self, keyword: str, sort: Optional[str] = None) -> dict:
-        """走浏览器取一份解密后的搜索数据。"""
+        """走浏览器取一份解密后的搜索数据。
+
+        sort 显式传空串表示综合排序（不带 sort_type），不能和「没传」混为一谈，
+        所以这里按 None 判而不是按真假判。
+        """
         fetcher = await self._get_fetcher()
-        sort_type = sort or str(self.cfg("search_sort", SORT_ASC) or SORT_ASC)
+        if sort is None:
+            sort_type = str(self.cfg("search_sort", SORT_ASC) or SORT_ASC).strip()
+        else:
+            sort_type = str(sort).strip()
         try:
             return await fetcher.search(keyword, sort=sort_type)
         except BrowserError as e:
@@ -1704,18 +1842,25 @@ class PDDMonitorPlugin(Star):
         整页一条都搜不出来。浏览器地址栏发的就是 %20，这里跟浏览器对齐。
 
         sort 显式传入时不读配置，供 /盯价 debug 做「换种排序再试一次」的对照。
+        传空串（SORT_DEFAULT）表示综合排序：不带 sort_type 参数。
         """
-        sort = str(sort or self.cfg("search_sort", SORT_ASC) or SORT_ASC).strip()
-        if sort not in (SORT_ASC, SORT_DESC):
+        if sort is None:
+            sort = str(self.cfg("search_sort", SORT_ASC) or SORT_ASC).strip()
+        sort = str(sort).strip()
+        if sort not in (SORT_DEFAULT, SORT_ASC, SORT_DESC):
             sort = SORT_ASC
         # 连续空白压成一个，首尾去掉；中间的空格是「同时包含」的分词边界，要保留
         key = re.sub(r"\s+", " ", keyword or "").strip()
         # 参数保持最小集：实测浏览器只带 search_key 也能出商品，
         # 多带 search_type/source 之类反而可能与真实入口不同，不画蛇添足。
-        query = {"search_key": key, "sort_type": sort, "page": str(page)}
+        query = {"search_key": key}
+        if sort:
+            query["sort_type"] = sort
+        query["page"] = str(page)
         return SEARCH_URL + "?" + urlencode(query, quote_via=quote)
 
-    async def _first_price(self, keyword: str, attempts: int = 2) -> dict:
+    async def _first_price(self, keyword: str, attempts: int = 2,
+                           refresh_baseline: bool = False) -> dict:
         """手动取一次价：失败且不像风控时再试一次。
 
         add 是用户当场等结果的场景，一次空壳就把关键词存进去、显示「未取到价」，
@@ -1726,7 +1871,7 @@ class PDDMonitorPlugin(Star):
         last: Optional[Exception] = None
         for i in range(max(1, attempts)):
             try:
-                return await self._search_keyword(keyword)
+                return await self._search_keyword(keyword, refresh_baseline=refresh_baseline)
             except Exception as e:
                 last = e
                 if getattr(e, "risk", False) or i >= attempts - 1:
@@ -1736,17 +1881,8 @@ class PDDMonitorPlugin(Star):
             raise last
         raise PddFetchError("取价失败")
 
-    async def _search_keyword(self, keyword: str, sort: Optional[str] = None) -> dict:
-        """按关键词搜索，返回价格最低的那件商品。
-
-        取价口径：搜索页 item 里的 price（单位分），即页面展示的拼单价。
-        H5 搜索页不下发券后价，所以这里不扣券（要精确到手价只能逐件进详情页，
-        那样每轮请求量会翻几十倍，风控风险不成比例）。
-        """
-        keyword = (keyword or "").strip()
-        if not keyword:
-            raise PddFetchError("关键词为空")
-
+    async def _fetch_candidates(self, keyword: str, sort: Optional[str]) -> tuple[list[dict], str]:
+        """取一页搜索结果，只留带价格的商品。返回 (候选, 页面原文)。"""
         mode = self._fetch_mode()
         html = ""
         raw: Optional[dict] = None
@@ -1806,21 +1942,68 @@ class PDDMonitorPlugin(Star):
                 f"{no_price} 件缺价格字段，字段名可能改了｜上报此条等待适配",
                 html=html,
             )
+        return candidates, html
 
-        # 先按价格升序：后面「前 N 条」「该商品往后两条」都以这个顺序为准
+    async def _search_keyword(self, keyword: str, sort: Optional[str] = None,
+                              refresh_baseline: bool = False) -> dict:
+        """按关键词搜索，返回价格最低的那件商品。
+
+        取价口径：搜索页 item 里的 price（单位分），即页面展示的拼单价。
+        H5 搜索页不下发券后价，所以这里不扣券（要精确到手价只能逐件进详情页，
+        那样每轮请求量会翻几十倍，风控风险不成比例）。
+
+        两段式取价（use_price_baseline 开启时）：
+        1. 综合排序那一页当「尺子」——推荐排序按相关性出结果，混进来的杂型号少，
+           价格落在真实档位；
+        2. 价格升序那一页当「候选」——最便宜的一批在这里，但它会被更便宜的
+           近似型号占满（搜 5070ti 首页全是 5070），单看这一页没有可比样本。
+        用 1 的下沿和型号去筛 2，再从筛剩的里取最小，才是这个型号的真实低价。
+        """
+        keyword = (keyword or "").strip()
+        if not keyword:
+            raise PddFetchError("关键词为空")
+
+        # 基准先取：它是「尺子」，拿不到就先按单页逻辑走，别让一次基准失败把整轮拖成取价失败。
+        # 风控类失败例外——那种情况继续请求只会更糟，必须抛上去中止本轮。
+        # filter_price_outliers 是价格剔除的总开关：关掉它就不取基准了，
+        # use_price_baseline 只决定「用基准筛」还是「在单页内按 MAD 筛」。
+        want_band = (self._use_baseline() and self._is_price_sort(sort)
+                     and bool(self.cfg("filter_price_outliers", True)))
+        band: dict[str, Any] = {}
+        if want_band:
+            try:
+                band = await self._price_baseline(keyword, refresh=refresh_baseline)
+            except PddFetchError as e:
+                if getattr(e, "risk", False):
+                    raise
+                band = {"mode": "error", "note": str(e)}
+
+        candidates, html = await self._fetch_candidates(keyword, sort)
+        # 先按价格升序：后面「前 N 条」「该商品往后三条」都以这个顺序为准
         candidates.sort(key=lambda c: c["price_cents"])
 
-        # 剔除离群价格：搜索「9700X」会混进 ¥3.99 的硅脂、¥19.9 的扣具，
-        # 它们的标题同样含 9700X，只靠标题匹配分不出来（关键词越短越分不出来），
-        # 得先按价格把这一簇剔掉，剩下的才是同一类商品。
         pool = candidates
         outlier_info: dict[str, Any] = {"outlier_mode": "off", "outlier_total": len(candidates)}
-        if bool(self.cfg("filter_price_outliers", True)):
-            pool, outlier_info = filter_price_outliers(
-                candidates,
-                k=self._outlier_k(),
-                min_drop_ratio=self._outlier_drop_ratio(),
-            )
+        model_info: dict[str, Any] = {"model_mode": "off"}
+        baseline_info: dict[str, Any] = {"baseline_mode": "off"}
+
+        if band:
+            pool, outlier_info, model_info, baseline_info = await self._narrow_by_baseline(
+                keyword, candidates, band)
+        else:
+            # 单页模式：没有外部尺子，只能在这一页内部按 MAD 剔
+            if bool(self.cfg("filter_price_outliers", True)):
+                pool, outlier_info = filter_price_outliers(
+                    candidates,
+                    k=self._outlier_k(),
+                    min_drop_ratio=self._outlier_drop_ratio(),
+                )
+            pool, model_info = self._apply_model_gate(keyword, pool)
+
+        # 兜底：任何一道筛子都不该把池子清空，真清空了就按原样取，
+        # 让这一轮先拿到价——比抛 IndexError 有用
+        if not pool:
+            pool = candidates
 
         anchor_idx = 0
         match_info: dict[str, Any] = {"match_mode": "off"}
@@ -1835,7 +2018,169 @@ class PDDMonitorPlugin(Star):
         anchor["scanned"] = len(candidates)
         anchor.update(match_info)
         anchor.update(outlier_info)
+        anchor.update(model_info)
+        anchor.update(baseline_info)
         return anchor
+
+    # ---------------- 基准价与型号校验 ----------------
+    def _use_baseline(self) -> bool:
+        return bool(self.cfg("use_price_baseline", True))
+
+    def _baseline_ratio(self) -> float:
+        """基准下沿占中位数的比例。填 70 表示低于七折就当作不同档商品。"""
+        try:
+            pct = float(self.cfg("baseline_floor_percent", DEFAULT_BASELINE_FLOOR_PCT))
+        except (TypeError, ValueError):
+            pct = float(DEFAULT_BASELINE_FLOOR_PCT)
+        return max(0.3, min(1.0, pct / 100.0))
+
+    def _is_price_sort(self, sort: Optional[str]) -> bool:
+        """按价格排的那两路才需要基准。
+
+        综合排序本身就是尺子，再给它套一个基准没有意义。
+        """
+        s = str(sort if sort is not None else self.cfg("search_sort", SORT_ASC)
+                or SORT_ASC).strip()
+        return s in (SORT_ASC, SORT_DESC)
+
+    async def _price_baseline(self, keyword: str, refresh: bool = False) -> dict[str, Any]:
+        """综合排序那一页的价格带，带缓存。
+
+        基准只回答「这个型号大致多少钱」，半天内的漂移可以忽略，所以存进监控项里。
+        缓存住它，稳态下巡检仍是每个关键词一次请求，只有过期那一轮多打一次。
+        """
+        key = keyword_key(keyword)
+        item = self.store.goods.get(key) or {}
+        cached = item.get("price_band") or {}
+        now = time.time()
+        fresh = bool(cached) and (now - float(cached.get("at") or 0) < BASELINE_TTL)
+        if fresh and not refresh:
+            return {**cached, "baseline_mode": "cache"}
+
+        items, _html = await self._fetch_candidates(keyword, SORT_DEFAULT)
+        band = price_band(items, k=self._outlier_k(),
+                          min_drop_ratio=self._baseline_ratio())
+        band["at"] = int(now)
+        band["n"] = len(items)
+        # 综合排序的整页留着当退路：升序页全被近似型号占满时用它出价
+        band["items"] = sorted(items, key=lambda c: c["price_cents"])
+        if item:
+            item["price_band"] = {k2: band.get(k2) for k2 in ("mode", "median", "floor",
+                                                              "cutoff", "at", "n")}
+        return {**band, "baseline_mode": "fresh" if cached else "new"}
+
+    def _apply_model_gate(self, keyword: str, items: list[dict]) -> tuple[list[dict], dict[str, Any]]:
+        """型号整串必须在标题里。
+
+        搜「5070ti」会混进大量「5070」：分词能命中「5070」，重合度就有 50%，
+        而价格便宜三千，按价格升序取必然取到 5070——这就是盯 5070ti 却记成
+        八千块的原因。这类混淆只能靠整串比对区分，分词打分会主动帮倒忙。
+        """
+        if not bool(self.cfg("model_must_match", True)):
+            return items, {"model_mode": "off"}
+        model = model_key(keyword)
+        if not model:
+            return items, {"model_mode": "skip"}
+        kept = [c for c in items if model in squash(c.get("title"))]
+        if not kept:
+            return items, {"model_mode": "miss", "model_key": model,
+                           "model_note": f"没有一条标题含「{model}」"}
+        return kept, {
+            "model_mode": "on",
+            "model_key": model,
+            "model_total": len(items),
+            "model_dropped": len(items) - len(kept),
+        }
+
+    @staticmethod
+    def _baseline_info(band: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "baseline_mode": band.get("baseline_mode") or band.get("mode") or "off",
+            "baseline_median": band.get("median") or 0,
+            "baseline_floor": band.get("floor") or 0,
+            "baseline_cutoff": band.get("cutoff") or 0,
+            "baseline_n": band.get("n") or 0,
+            "baseline_total": band.get("total") or 0,
+            "baseline_at": band.get("at") or 0,
+        }
+
+    @staticmethod
+    def _band_record(info: dict[str, Any]) -> dict[str, Any]:
+        """把诊断里的基准字段收成可缓存的一条。
+
+        add 时已经算过一次基准，顺手存下来，别让下一轮巡检为了同一个值再打一次。
+        """
+        return {
+            "mode": "ok",
+            "median": info.get("baseline_median") or 0,
+            "floor": info.get("baseline_floor") or 0,
+            "cutoff": info.get("baseline_cutoff") or 0,
+            "at": int(info.get("baseline_at") or time.time()),
+            "n": info.get("baseline_n") or 0,
+        }
+
+    async def _narrow_by_baseline(
+        self, keyword: str, candidates: list[dict], band: dict[str, Any]
+    ) -> tuple[list[dict], dict[str, Any], dict[str, Any], dict[str, Any]]:
+        """用综合排序的价格带和型号去筛价格升序那一页。
+
+        三道，任何一道把候选筛空就退回上一道的结果并记下原因——宁可给一个
+        带注释的价格，也不要因为一次取数就判成「取价失败」。
+        """
+        baseline_info = self._baseline_info(band)
+        cutoff = int(band.get("cutoff") or 0)
+        if band.get("mode") != "ok" or not cutoff:
+            # 基准样本不够，退回单页 MAD
+            pool, info = filter_price_outliers(
+                candidates, k=self._outlier_k(), min_drop_ratio=self._outlier_drop_ratio())
+            pool, model_info = self._apply_model_gate(keyword, pool)
+            baseline_info["baseline_mode"] = "thin"
+            return pool, info, model_info, baseline_info
+
+        # 第一道：价格不低于基准下沿（配件、引流 SKU 在这里出局）
+        above = [c for c in candidates if c["price_cents"] >= cutoff]
+        # 第二道：型号整串命中（5070 在这里出局）
+        gated, model_info = self._apply_model_gate(keyword, above)
+        # miss 表示一条都没命中，此时 _apply_model_gate 原样返回，不能当成功
+        if gated and model_info.get("model_mode") != "miss":
+            pool = gated
+            outlier_info = {
+                "outlier_mode": "baseline",
+                "outlier_total": len(candidates),
+                "outlier_kept": len(pool),
+                "outlier_dropped": len(candidates) - len(pool),
+                "outlier_cutoff": cutoff,
+            }
+            return pool, outlier_info, model_info, baseline_info
+
+        # 升序页一条能用的都没有：改用综合排序那一页，那里至少是相关商品。
+        # 这种情况说明升序页被更便宜的近似型号占满了，价格仍要给出，但要说清来源。
+        fallback = band.get("items") or []
+        if not fallback and band.get("baseline_mode") == "cache":
+            # 缓存里只存了价格带、没存整页。要退路就得再取一次，
+            # 这条只在「升序页全军覆没」时走到，不是常规开销。
+            band = await self._price_baseline(keyword, refresh=True)
+            baseline_info = self._baseline_info(band)
+            fallback = band.get("items") or []
+        if fallback:
+            pool, model_info = self._apply_model_gate(keyword, fallback)
+            model_info["model_fallback"] = True
+            outlier_info = {
+                "outlier_mode": "baseline_page",
+                "outlier_total": len(candidates),
+                "outlier_kept": len(pool),
+                "outlier_dropped": 0,
+                "outlier_cutoff": cutoff,
+            }
+            baseline_info["baseline_fallback"] = True
+            return pool, outlier_info, model_info, baseline_info
+
+        # 连综合排序也没东西：退回原始候选，别让这一轮直接失败
+        pool, outlier_info = filter_price_outliers(
+            candidates, k=self._outlier_k(), min_drop_ratio=self._outlier_drop_ratio())
+        baseline_info["baseline_mode"] = "empty"
+        return pool, outlier_info, model_info, baseline_info
+
 
     def _outlier_k(self) -> float:
         """MAD 的倍数：越大越宽容。2 严格、3 标准、4 宽松。"""
@@ -1876,6 +2221,8 @@ class PDDMonitorPlugin(Star):
         """
         pool_n = self._title_pool_size()
         pool = candidates[:pool_n]
+        if not pool:
+            return 0, {"match_mode": "fallback", "match_note": "没有可比的商品"}
         kw_tokens = tokenize(keyword)
 
         if not kw_tokens:
@@ -2261,6 +2608,9 @@ class PDDMonitorPlugin(Star):
             item["samples"] = best.get("samples") or []
             if item.get("goods_id"):
                 item["share_link"] = GOODS_URL.format(item["goods_id"])
+            # 这一步已经取过基准，存下来，下一轮巡检不用为同一个值再打一次
+            if best.get("baseline_cutoff"):
+                item["price_band"] = self._band_record(best)
             self.store.apply_price(keyword_key(keyword), best["price_cents"])
 
         self.store.bind_session(event.unified_msg_origin)
@@ -2549,10 +2899,11 @@ class PDDMonitorPlugin(Star):
         return ("匹配", text)
 
     def _outlier_row(self, best: dict) -> tuple[str, str]:
-        """说明价格离群剔除的结果。
+        """说明价格筛掉了哪些、留下了多少。
 
-        阈值取的是「MAD 下限」和「中位数百分比闸门」里更小的那个 ——
-        实际生效的往往是闸门，所以按它显示，免得看到的数字和剔掉的对不上。
+        两种口径都要能读懂：
+        - baseline：拿综合排序那页的基准下沿去筛升序页
+        - mad：单页内部按中位数绝对偏差剔（基准关掉时走这条）
         """
         mode = str(best.get("outlier_mode") or "off")
         total = best.get("outlier_total") or 0
@@ -2560,15 +2911,66 @@ class PDDMonitorPlugin(Star):
             return ("过滤", "未启用价格离群剔除")
         if mode == "skip":
             return ("过滤", f"{best.get('outlier_note') or '未做剔除'} · 共 {total} 条")
+
         kept = best.get("outlier_kept") or 0
         dropped = best.get("outlier_dropped") or 0
         cutoff = best.get("outlier_cutoff") or best.get("outlier_floor")
+        if mode == "baseline_page":
+            return ("过滤", f"升序页没有可用商品，改用综合排序那一页 · {kept} 条")
+        if mode == "baseline":
+            return ("过滤", f"剔除 {dropped} 条低于基准 · 保留 {kept}/{total}"
+                            + (f" · 下沿 {fmt_yuan(cutoff)}" if cutoff else ""))
+
         text = (f"剔除 {dropped} 条低价离群 · 保留 {kept}/{total}"
                 f" · 下限 {fmt_yuan(cutoff)}")
         floor = best.get("outlier_floor")
         if cutoff and floor and int(cutoff) < int(floor):
             text += f" · 比例闸门 {self._outlier_drop_ratio():.0%} 生效"
         return ("过滤", text)
+
+    def _baseline_row(self, best: dict) -> tuple[str, str]:
+        """基准从哪来、多少钱、多久前取的。价格不对时第一个要看的就是这行。"""
+        mode = str(best.get("baseline_mode") or "off")
+        if mode == "off":
+            if not bool(self.cfg("filter_price_outliers", True)):
+                return ("基准", "价格剔除已关闭")
+            return ("基准", "未启用 · 只在单页内部剔离群")
+        if mode == "thin":
+            return ("基准", "综合排序样本不足，本次只在单页内剔离群")
+
+        median = best.get("baseline_median") or 0
+        n = best.get("baseline_n") or 0
+        if mode == "cache":
+            at = int(best.get("baseline_at") or 0)
+            text = f"综合排序 {n} 条 · 中位 {fmt_yuan(median)} · 缓存 {_ago_text(at)}"
+        else:
+            text = f"综合排序 {n} 条 · 中位 {fmt_yuan(median)} · 刚取"
+        if best.get("baseline_fallback"):
+            text += " · 按此页出价"
+        return ("基准", text)
+
+    def _model_row(self, best: dict) -> tuple[str, str] | None:
+        """型号整串校验：这一步负责把 5070 从 5070ti 的搜索结果里分出去。"""
+        mode = str(best.get("model_mode") or "off")
+        if mode == "off":
+            return None
+        if mode == "skip":
+            return None
+        if mode == "miss":
+            return ("型号", f"没有一条标题含「{best.get('model_key')}」· 已退回按价格取")
+        key = best.get("model_key") or ""
+        dropped = best.get("model_dropped") or 0
+        if not dropped:
+            return ("型号", f"{key} · 全部命中")
+        return ("型号", f"{key} · 剔除 {dropped} 条不含该型号的")
+
+    def _readable_url(self, keyword: str) -> str:
+        """给人看的请求地址：中文保持可读，空格写成 %20。
+
+        直接 unquote 会让空格以原样出现，看起来像是没编码就发出去了——实际发的是
+        %20。这里只把空格还原成编码形态，其余保持可读，免得对着它排查错方向。
+        """
+        return unquote(self._search_url(keyword)).replace(" ", "%20")
 
     async def _debug_keyword(self, keyword: str) -> str:
         keyword = (keyword or "").strip()
@@ -2579,8 +2981,9 @@ class PDDMonitorPlugin(Star):
             sort = SORT_ASC
         try:
             # 与 add 走同一条路径：排查用的那一次也该重试，否则同一个词会出现
-            # 「add 说没价、debug 有价」这种自相矛盾的结果
-            best = await self._first_price(keyword)
+            # 「add 说没价、debug 有价」这种自相矛盾的结果。
+            # 基准强制重取：诊断是给人核对「基准准不准」用的，拿几小时前的缓存没有意义。
+            best = await self._first_price(keyword, refresh_baseline=True)
         except Exception as e:
             page_html = getattr(e, "html", "") or ""
             first, reason, action = split_error(str(e))
@@ -2589,7 +2992,7 @@ class PDDMonitorPlugin(Star):
                 rows.append(("原因", shorten(reason, 120)))
             if action:
                 rows.append(("处理", shorten(action, 120)))
-            rows.append(("请求", shorten(unquote(self._search_url(keyword)), 100)))
+            rows.append(("请求", shorten(self._readable_url(keyword), 100)))
             if page_html:
                 rows.append(("页面", self._page_line(self._extract_raw_data(page_html), page_html)))
             rows += self._cookie_rows()
@@ -2617,14 +3020,23 @@ class PDDMonitorPlugin(Star):
 
         rows = [
             ("命中", f"{best.get('scanned') or best.get('count', 0)} 条"),
+            self._baseline_row(best),
             self._outlier_row(best),
+        ]
+        model_row = self._model_row(best)
+        if model_row:
+            rows.append(model_row)
+        rows += [
             ("最低", fmt_yuan(best["price_cents"])),
             ("商品", shorten(best.get("title") or "", 24)),
         ]
         if best.get("goods_id"):
             rows.append(("编号", str(best["goods_id"])))
         rows.append(self._match_row(best))
-        rows.append(("排序", f"{sort}（{'升序' if sort == SORT_ASC else '降序'}）"))
+        sort_text = f"{sort}（{'升序' if sort == SORT_ASC else '降序'}）"
+        if self._use_baseline():
+            sort_text += " · 基准用综合排序"
+        rows.append(("排序", sort_text))
         rows += self._cookie_rows()
         rows += self._transport_rows()
         return head("诊断", keyword) + "\n" + rows_block(rows)

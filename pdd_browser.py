@@ -37,12 +37,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sys
 import time
 from collections import deque
 from pathlib import Path
 from typing import Any, Callable, Optional
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 
 try:  # 作为 AstrBot 插件的一部分加载
     from .pdd_log import get_logger
@@ -528,18 +529,35 @@ class BrowserFetcher:
         self._searches = 0
 
     # -------------------------------------------------------------------- 取数
+    @staticmethod
+    def _search_query(keyword: str, sort: str = "", page: int = 1) -> str:
+        """拼查询串。关键词一律编码，空格用 %20。
+
+        连续空白压成一个：中间的空格是「同时包含」的分词边界，要保留但不必留多个。
+        """
+        params = {"search_key": re.sub(r"\s+", " ", keyword or "").strip()}
+        if sort:
+            params["sort_type"] = str(sort)
+        params["page"] = str(int(page) or 1)
+        return urlencode(params, quote_via=quote)
+
     async def search(self, keyword: str, sort: str = "price", page: int = 1) -> dict:
         """搜一个关键词，返回解密后的整份响应（dict）。
 
         返回的是原始结构，交给插件自己的 `_find_goods_list` 去认商品 ——
         这样哪天拼多多把商品又换个地方包一层，只改解析层就够了。
+
+        sort 传空串表示综合排序：不带 sort_type。综合排序是拼多多自己的推荐
+        结果，相关性强，插件拿它当价格基准（见 main 里的 use_price_baseline）。
         """
         keyword = (keyword or "").strip()
         if not keyword:
             raise BrowserError("关键词为空")
 
-        url = (f"{SEARCH_URL}?search_key={keyword}"
-               f"&sort_type={sort or 'price'}&page={int(page) or 1}")
+        # 关键词必须编码后再拼进 URL。带空格的词（「RTX5070ti ultra」）直接拼进去，
+        # 空格会被当成 URL 的结束，服务端只收到前半截，页面是个空壳。
+        # 空格要编成 %20 而不是 +：+ 代表空格只是表单编码的约定，前端按字面量解。
+        url = f"{SEARCH_URL}?{self._search_query(keyword, sort, page)}"
 
         async with self._lock:          # 一个浏览器实例串行用，别并发抢页面
             # 回收和启动都放在锁里：并发调用时两边都判 browser is None 会起两个进程
