@@ -5,3 +5,11 @@ version: v4.1.0
 author: Hamster
 repo: "https://github.com/HamsterKun/astrbot_plugin_pdd_monitor"
 astrbot_version: ">=3.4.28"
+support_platforms:
+  - aiocqhttp
+tags:
+  - 拼多多
+  - 价格监控
+  - 盯价
+  - 主动交互
+  - 走势报告
