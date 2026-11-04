@@ -37,22 +37,26 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import sys
+import time
 from collections import deque
 from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import urlsplit
 
 try:  # 作为 AstrBot 插件的一部分加载
+    from .pdd_log import get_logger
     from .socks_relay import Socks5Relay
 except ImportError:  # 被当普通脚本 import 时没有包上下文
     sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from pdd_log import get_logger
     from socks_relay import Socks5Relay
 
-log = logging.getLogger("pdd.browser")
+# 日志走宿主 logger（见 pdd_log）；独立运行时退回标准输出
+log = get_logger()
 
 SEARCH_URL = "https://mobile.yangkeduo.com/search_result.html"
+HOME_URL = "https://mobile.yangkeduo.com/"
 
 # 移动端环境三要素：iPhone UA + 440×956 视口 + is_mobile。少一个就会被判
 # 「系统繁忙」—— 用桌面 UA 去访问搜索页必定失败。
@@ -209,7 +213,12 @@ class BrowserFetcher:
     """一个长期存活的 Chromium，按次开上下文取一份搜索数据。
 
     Chromium 启动要一两秒，所以实例复用、上下文每次新建 —— 上下文里带 cookie
-    和 UA，用完就关，避免页面之间互相影响，也避免内存越用越多。
+    和 UA，用完就关，避免页面之间互相影响。
+
+    但进程本身必须定期退出。Chromium 关闭页面、关闭上下文都不会把内存还给系统：
+    V8 堆、网络缓存、渲染进程的私有页一旦涨上去就贴着不动。长时间跑下来 RSS
+    只增不减，机房小内存机器会被拖到换页。所以这里有两道回收：
+    取数够 N 次回收一次，空闲超过 N 秒回收一次。回收 = 进程退出 = 内存全额归还。
     """
 
     def __init__(
@@ -224,6 +233,9 @@ class BrowserFetcher:
         poll_interval: float = 0.4,
         auto_install: bool = True,
         install_timeout: float = 900.0,
+        idle_timeout: float = 600.0,
+        max_searches: int = 12,
+        warm_home: bool = True,
         on_log: Optional[Callable[[str], None]] = None,
     ):
         self.proxy = (proxy or "").strip()
@@ -235,6 +247,9 @@ class BrowserFetcher:
         self.poll_interval = max(0.1, float(poll_interval))
         self.auto_install = bool(auto_install)
         self.install_timeout = max(60.0, float(install_timeout))
+        self.idle_timeout = max(0.0, float(idle_timeout))
+        self.max_searches = max(0, int(max_searches))
+        self.warm_home = bool(warm_home)
         self._log_fn = on_log
 
         self._pw = None
@@ -245,15 +260,26 @@ class BrowserFetcher:
         # 内核状态：'' 未知 / 'installing' 下载中 / 'installed' 刚补上 / 'failed' 补失败
         self.kernel_state = ""
         self.kernel_error = ""
+        # 回收计数：本进程实例已取数几次、最后一次用是什么时候
+        self._searches = 0
+        self._last_used = 0.0
+        self.recycled = 0          # 累计回收次数，供诊断显示
+        self._home_warmed = False  # 本浏览器进程是否已访问过首页
 
     # ---------------------------------------------------------------- 生命周期
     def _log(self, msg: str) -> None:
-        log.debug(msg)
+        """交出去记，没人接才自己记。
+
+        插件里 main 会传一个回调（顺带给消息加 [pdd] 前缀），此时不必再写一遍，
+        否则同一行日志出现两次。
+        """
         if self._log_fn:
             try:
                 self._log_fn(msg)
+                return
             except Exception:
                 pass
+        log.debug(msg)
 
     async def start(self) -> None:
         if self._browser is not None:
@@ -277,8 +303,27 @@ class BrowserFetcher:
 
         kwargs: dict[str, Any] = {
             "headless": self.headless,
-            "args": ["--no-sandbox", "--disable-dev-shm-usage",
-                     "--disable-blink-features=AutomationControlled"],
+            "args": [
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+                # 无头取数用不到 GPU，省掉显存与共享内存映射
+                "--disable-gpu",
+                # 单页场景，限制渲染进程数，避免每个 iframe 各起一个进程
+                "--renderer-process-limit=1",
+                # 只渲染一页，浏览器其余功能全部关掉，减少常驻内存与后台请求
+                "--mute-audio",
+                "--no-first-run",
+                "--disable-extensions",
+                "--disable-sync",
+                "--disable-background-networking",
+                "--disable-component-update",
+                "--disable-features=Translate,MediaRouter,OptimizationHints",
+                # 磁盘缓存压到 1MB：每次都是同一个搜索页，缓不缓存区别不大
+                "--disk-cache-size=1048576",
+                # 给渲染进程的 V8 堆封顶。默认上限按物理内存算，小机器上会越吃越多
+                "--js-flags=--max-old-space-size=512",
+            ],
         }
         if self.channel:
             # 默认的 headless=True 走 chrome-headless-shell，那是个精简壳子，
@@ -294,6 +339,8 @@ class BrowserFetcher:
         except Exception:
             await self._shutdown_pw()
             raise
+        # 新进程 = 新的浏览器存储，首页要重新访一次
+        self._home_warmed = False
         self._log(f"浏览器已启动（headless={self.headless}"
                   f"{', channel=' + self.channel if self.channel else ''}）")
 
@@ -407,12 +454,20 @@ class BrowserFetcher:
 
     async def close(self) -> None:
         await self._shutdown_pw()
-        if self._relay is not None:
+
+    def _stop_relay(self) -> None:
+        """收掉本地中继。
+
+        必须跟浏览器一起收：每次 launch 都会 `_build_proxy()` 新建一个中继
+        （新线程、新随机端口），旧的不停就漏一个线程和一个端口。回收重启会频繁
+        走这条路，漏起来很快。
+        """
+        relay, self._relay = self._relay, None
+        if relay is not None:
             try:
-                self._relay.stop()
+                relay.stop()
             except Exception:
                 pass
-            self._relay = None
 
     @staticmethod
     def _is_dead_browser(err: Exception) -> bool:
@@ -429,20 +484,48 @@ class BrowserFetcher:
                                        "browser closed",
                                        "browser disconnected"))
 
-    async def _shutdown_pw(self) -> None:
+    async def _shutdown_pw(self, timeout: float = 15.0) -> None:
+        """关掉浏览器、驱动、中继。三条路都要收干净，否则重载插件会攒进程。"""
         browser, pw = self._browser, self._pw
         self._browser = None
         self._pw = None
         if browser is not None:
             try:
-                await browser.close()
+                # close 在浏览器卡住时会一直挂着，插件重载就卡在这里
+                await asyncio.wait_for(browser.close(), timeout=timeout)
             except Exception:
                 pass
         if pw is not None:
             try:
-                await pw.stop()
+                # stop 会让 driver 退出，它下面的浏览器子进程随之被杀
+                await asyncio.wait_for(pw.stop(), timeout=5.0)
             except Exception:
                 pass
+        self._stop_relay()
+
+    async def _maybe_recycle(self) -> None:
+        """判断该不该把整个浏览器进程换掉。
+
+        Chromium 释放页面、释放上下文，都不会把内存还给系统。只有进程退出才可以。
+        所以这里按「用得多」和「放得久」两个条件主动退一次：
+          - 连续取数到 max_searches 次（一轮巡检里监控项多时会触发）
+          - 距上次取数超过 idle_timeout 秒（巡检间隔 30 分钟，每轮开头必触发）
+        """
+        if self._browser is None:
+            return
+        reason = ""
+        if self.max_searches and self._searches >= self.max_searches:
+            reason = f"已取数 {self._searches} 次"
+        elif self.idle_timeout and self._last_used:
+            idle = time.time() - self._last_used
+            if idle >= self.idle_timeout:
+                reason = f"空闲 {int(idle // 60)} 分钟"
+        if not reason:
+            return
+        self._log(f"回收浏览器（{reason}），释放内存")
+        self.recycled += 1
+        await self._shutdown_pw()
+        self._searches = 0
 
     # -------------------------------------------------------------------- 取数
     async def search(self, keyword: str, sort: str = "price", page: int = 1) -> dict:
@@ -454,12 +537,17 @@ class BrowserFetcher:
         keyword = (keyword or "").strip()
         if not keyword:
             raise BrowserError("关键词为空")
-        await self.start()
 
         url = (f"{SEARCH_URL}?search_key={keyword}"
                f"&sort_type={sort or 'price'}&page={int(page) or 1}")
 
         async with self._lock:          # 一个浏览器实例串行用，别并发抢页面
+            # 回收和启动都放在锁里：并发调用时两边都判 browser is None 会起两个进程
+            try:
+                await self._maybe_recycle()
+                await self.start()
+            except BrowserError:
+                raise
             try:
                 return await self._search_locked(url, keyword)
             except BrowserError:
@@ -475,6 +563,33 @@ class BrowserFetcher:
                 except Exception as e2:
                     raise BrowserError(f"浏览器重启失败：{e2}") from e2
                 return await self._search_locked(url, keyword)
+            finally:
+                # 失败也算一次：崩掉的那次一样占过内存
+                self._searches += 1
+                self._last_used = time.time()
+
+    async def _warm_context(self, ctx) -> None:
+        """用一张临时页访问首页，让服务端下发设备 cookie。
+
+        单开一页而不是复用搜索页：hook 把 JSON.parse 的载荷存在 window 上，
+        首页的数据混进来，后面轮询可能拿到首页的推荐列表当搜索结果。
+        失败不报错——预热只是加分项，缺了顶多这一次取数白跑。
+        """
+        page = None
+        try:
+            page = await ctx.new_page()
+            await page.goto(HOME_URL, wait_until="domcontentloaded",
+                            timeout=min(self.timeout, 20.0) * 1000)
+            self._home_warmed = True
+            self._log("已访问首页，设备 cookie 就绪")
+        except Exception as e:
+            self._log(f"首页预热失败（继续取数）：{e}")
+        finally:
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
 
     async def _search_locked(self, url: str, keyword: str) -> dict:
         ctx = None
@@ -495,6 +610,12 @@ class BrowserFetcher:
                     await ctx.add_cookies(cookies)
                 except Exception as e:
                     self._log(f"注入 cookie 失败（继续跑）：{e}")
+
+            # 本进程第一次取数：先用同一 context 访问首页，拿 api_uid 等设备 cookie。
+            # 少了这一步，直接打开搜索页常常只得到一个不渲染的空壳（标题「拼多多」、
+            # 正文空白），hook 自然截不到数据。放进 context 里做，cookie 才对搜索页生效。
+            if self.warm_home and not self._home_warmed:
+                await self._warm_context(ctx)
 
             page = await ctx.new_page()
             await page.add_init_script(STEALTH_JS)
@@ -557,7 +678,7 @@ class BrowserFetcher:
     @staticmethod
     def _explain(diag: dict, keyword: str) -> str:
         """把失败原因压成「现象｜原因｜处理」三段。三种情况长得像，处理办法完全不同。"""
-        text = (diag.get("text") or "")
+        text = (diag.get("text") or "").strip()
         url = (diag.get("url") or "")
         title = (diag.get("title") or "")
         hits = diag.get("hits") or 0
@@ -574,7 +695,7 @@ class BrowserFetcher:
             return (f"页面渲染出 {diag['prices']} 个价格，hook 未截到明文｜"
                     f"数据不再经 JSON.parse｜上报此条等待适配；临时可改 fetch_mode=http")
         if not text:
-            return (f"等待 {keyword} 的结果超时，正文为空｜链路不通或页面未加载｜"
-                    f"检查 proxy 与服务器出站")
+            return ("搜索页正文为空｜页面壳没渲染出来，多见于首次访问缺设备 cookie｜"
+                    "重试一次；连续如此检查 cookie 与出口代理")
         return (f"未取到商品数据｜标题「{title}」，正文开头：{text[:80]}｜上报此条")
 

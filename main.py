@@ -1020,6 +1020,34 @@ class PDDMonitorPlugin(Star):
         mode = str(self.cfg("fetch_mode", "browser") or "browser").strip().lower()
         return mode if mode in ("browser", "http", "auto") else "browser"
 
+    def _idle_seconds(self) -> float:
+        """空闲回收阈值，秒。0 表示不按空闲回收。"""
+        try:
+            minutes = float(self.cfg("browser_idle_minutes", 10) or 0)
+        except (TypeError, ValueError):
+            minutes = 10.0
+        return max(0.0, minutes) * 60.0
+
+    def _max_searches(self) -> int:
+        """取数次数回收阈值。0 表示不按次数回收。"""
+        try:
+            return max(0, int(self.cfg("browser_max_searches", 12) or 0))
+        except (TypeError, ValueError):
+            return 12
+
+    def _apply_recycle(self, fetcher: Any) -> None:
+        """把当前配置里的回收阈值同步给已有实例。
+
+        实例是复用的，阈值在构造时定死。不同步的话改完配置要重载插件才生效，
+        而这类值多半是「内存涨了就先调小试试」——当场生效才有意义。
+        """
+        try:
+            fetcher.idle_timeout = self._idle_seconds()
+            fetcher.max_searches = self._max_searches()
+            fetcher.warm_home = bool(self.cfg("warmup_home", True))
+        except Exception:
+            pass
+
     async def _get_fetcher(self):
         """惰性启动浏览器实例，之后每轮复用。
 
@@ -1031,6 +1059,7 @@ class PDDMonitorPlugin(Star):
                 "找不到 pdd_browser 模块，插件文件不完整。请整目录重新上传安装。"
             )
         if self._fetcher is not None:
+            self._apply_recycle(self._fetcher)
             return self._fetcher
 
         # 巡检和 /盯价 debug 可能撞在一起：不加锁会各起一个 Chromium，
@@ -1038,6 +1067,7 @@ class PDDMonitorPlugin(Star):
         # 单独一把锁，不能复用 self._lock —— 巡检本身就是持着它进来的。
         async with self._fetcher_lock:
             if self._fetcher is not None:
+                self._apply_recycle(self._fetcher)
                 return self._fetcher
 
             fetcher = BrowserFetcher(
@@ -1047,6 +1077,9 @@ class PDDMonitorPlugin(Star):
                 headless=bool(self.cfg("browser_headless", True)),
                 timeout=float(self.cfg("browser_timeout", 45) or 45),
                 auto_install=bool(self.cfg("browser_auto_install", True)),
+                idle_timeout=self._idle_seconds(),
+                max_searches=self._max_searches(),
+                warm_home=bool(self.cfg("warmup_home", True)),
                 user_agent=self._user_agent(),
                 on_log=lambda m: logger.debug("[pdd] %s", m),
             )
@@ -1682,6 +1715,27 @@ class PDDMonitorPlugin(Star):
         query = {"search_key": key, "sort_type": sort, "page": str(page)}
         return SEARCH_URL + "?" + urlencode(query, quote_via=quote)
 
+    async def _first_price(self, keyword: str, attempts: int = 2) -> dict:
+        """手动取一次价：失败且不像风控时再试一次。
+
+        add 是用户当场等结果的场景，一次空壳就把关键词存进去、显示「未取到价」，
+        观感和插件坏了没区别；而空壳多半是客户端水化的时序问题，重试一次常常就出价。
+        风控类失败不能重试——越试限得越久，所以按 risk 标记区分。
+        最终失败时抛出最后一次的异常，调用方拿到的仍是原文与 html 快照。
+        """
+        last: Optional[Exception] = None
+        for i in range(max(1, attempts)):
+            try:
+                return await self._search_keyword(keyword)
+            except Exception as e:
+                last = e
+                if getattr(e, "risk", False) or i >= attempts - 1:
+                    break
+                await asyncio.sleep(1.0)
+        if last is not None:
+            raise last
+        raise PddFetchError("取价失败")
+
     async def _search_keyword(self, keyword: str, sort: Optional[str] = None) -> dict:
         """按关键词搜索，返回价格最低的那件商品。
 
@@ -2188,10 +2242,11 @@ class PDDMonitorPlugin(Star):
                 ]),
             ])
 
+        # 首次取数比巡检多给一次机会：这一步失败会直接写在「已添加」的回执里
         best: Optional[dict] = None
         err = ""
         try:
-            best = await self._search_keyword(keyword)
+            best = await self._first_price(keyword)
         except Exception as e:
             err = str(e)
 
@@ -2363,6 +2418,24 @@ class PDDMonitorPlugin(Star):
             return " · 内核下载中"
         return ""
 
+    def _memory_note(self) -> str:
+        """报回收状态。
+
+        Chromium 关页面、关上下文都不还内存，只有进程退出才行，所以「回收过几次」
+        比「启动了没有」更能说明内存问题。不列出来用户只能靠 ps 猜。
+        """
+        if self._fetcher is None:
+            return "浏览器未启动"
+        used = int(getattr(self._fetcher, "_searches", 0) or 0)
+        recycled = int(getattr(self._fetcher, "recycled", 0) or 0)
+        cap = self._max_searches()
+        idle = self._idle_seconds()
+
+        bits = [f"已取数 {used}/{cap} 次" if cap else f"已取数 {used} 次"]
+        bits.append(f"回收 {recycled} 次")
+        bits.append(f"空闲 {int(idle // 60)} 分钟退出" if idle else "空闲回收已关")
+        return " · ".join(bits)
+
     def _transport_rows(self) -> list[tuple[str, str]]:
         """报当前取数与伪装方式——这决定了被风控检测的概率。"""
         mode = self._fetch_mode()
@@ -2382,6 +2455,7 @@ class PDDMonitorPlugin(Star):
                 ("UA", "自定义" if custom else "内置 iPhone Safari"),
                 ("指纹", "TLS/HTTP2 由 Chromium 生成 · curl_cffi 不参与"),
                 ("代理", self._proxy_line()),
+                ("内存", self._memory_note()),
             ]
 
         if self._transport:
@@ -2504,7 +2578,9 @@ class PDDMonitorPlugin(Star):
         if sort not in (SORT_ASC, SORT_DESC):
             sort = SORT_ASC
         try:
-            best = await self._search_keyword(keyword)
+            # 与 add 走同一条路径：排查用的那一次也该重试，否则同一个词会出现
+            # 「add 说没价、debug 有价」这种自相矛盾的结果
+            best = await self._first_price(keyword)
         except Exception as e:
             page_html = getattr(e, "html", "") or ""
             first, reason, action = split_error(str(e))

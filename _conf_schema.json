@@ -47,6 +47,18 @@
     "default": true,
     "hint": "pip 只装 playwright 这个 Python 包，Chromium 内核要另外下载（一百多 MB），首次安装插件时一定缺。开启后，取数时发现内核不存在会自动执行 python -m playwright install chromium，日志里能看到进度，下载完自动接着启动。关掉则只报错让你自己装。注：browser_channel 填了系统浏览器（chrome/edge）时不走自动下载。"
   },
+  "browser_idle_minutes": {
+    "type": "int",
+    "description": "浏览器空闲多久后退出（分钟）",
+    "default": 10,
+    "hint": "Chromium 关页面、关上下文都不把内存还给系统，只有进程退出才行——这也是插件常驻内存只涨不降的唯一解法。填 10 表示最后一次取数之后闲置 10 分钟就让整个浏览器退出。巡检间隔 30 分钟，所以每轮开头基本都会先回收一次再拉起，单次代价一两秒。填 0 关闭这道回收，内存会一直挂在峰值。"
+  },
+  "browser_max_searches": {
+    "type": "int",
+    "description": "同一浏览器进程最多取数几次",
+    "default": 12,
+    "hint": "取满这个次数就重启浏览器。监控项多的时候一轮里要连着取十几次，光靠空闲回收压不住——单轮内内存是一路涨的。填 0 关闭这道回收。估算方式：监控 10 项以内留 12 即可；监控 30 项填 30，让它在单轮内不重启，等下一轮开头空闲回收时自然退出。"
+  },
   "transport": {
     "type": "string",
     "description": "网络传输方式（影响 TLS 指纹）",
@@ -61,9 +73,9 @@
   },
   "warmup_home": {
     "type": "bool",
-    "description": "首轮巡检前先访问一次首页",
+    "description": "取数前先访问一次首页",
     "default": true,
-    "hint": "开启后，插件会先打开 mobile.yangkeduo.com 首页，让服务端下发基础的设备 cookie（api_uid 等），再去搜关键词。真实用户进站都是这个顺序，直接拿着搜索 URL 打过来反而异常。只多一次请求，建议保持开启。"
+    "hint": "开启后，插件会先打开 mobile.yangkeduo.com 首页，让服务端下发基础的设备 cookie（api_uid 等），再去搜关键词。真实用户进站都是这个顺序，直接拿着搜索 URL 打过来反而异常。浏览器模式下每个浏览器进程只做一次，多花一两秒；HTTP 模式下只做一次。关掉后首次搜索常常只拿到一个不渲染的空壳（标题「拼多多」、正文空白）。"
   },
   "search_sort": {
     "type": "string",

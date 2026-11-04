@@ -37,11 +37,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import logging
 import socket
 import sys
 import threading
 from urllib.parse import urlsplit
+
+try:  # 作为插件模块加载
+    from .pdd_log import get_logger, set_verbose
+except ImportError:  # 直接 python socks_relay.py 跑
+    from pdd_log import get_logger, set_verbose
 
 SOCKS5_VERSION = 0x05
 SOCKS5_NOAUTH = 0x00
@@ -60,7 +64,7 @@ REPLY_TEXT = {
     0x08: "上游不支持该地址类型",
 }
 
-log = logging.getLogger("socks-relay")
+log = get_logger()
 
 
 class Upstream:
@@ -462,11 +466,8 @@ def main() -> int:
     ap.add_argument("--verbose", "-v", action="store_true", help="打印每条连接的日志")
     args = ap.parse_args()
 
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)-5s %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    # 没有宿主 logger 时（直接跑本脚本）靠这个开关决定要不要打 debug
+    set_verbose(args.verbose)
 
     up = Upstream(args.upstream)
     relay = Socks5Relay(up, args.host, args.port)
