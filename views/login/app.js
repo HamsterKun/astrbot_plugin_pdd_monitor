@@ -84,15 +84,16 @@ function showFrame(b64) {
 }
 
 // 三种收尾：成功 / 失败 / 干净结束
+const OK_DONE = '服务器上的浏览器已经关了，这一页可以关掉了。';
+const OK_SHUTTING = '服务器上的浏览器正在关（几秒后自动退），这一页可以关掉了。';
+const OK_NEXT = '回聊天发「/盯价 add 关键词」开始盯价。';
+
 function finishOk(message, closed) {
   finished = true;
   setButtons(true, false);
   setChip('ok', `登录成功`);
-  okMsg = message || 'cookie 已写入配置';
-  const tail = closed
-    ? '服务器上的浏览器已经关了，这一页可以关掉了。'
-    : '服务器上的浏览器正在关（几秒后自动退），这一页可以关掉了。';
-  showOverlay('ok', '登录成功', `${okMsg}\n${tail}`, true);
+  okMsg = message || 'Cookie 已写入配置';
+  showOverlay('ok', '登录成功', `${okMsg}\n${closed ? OK_DONE : OK_SHUTTING}\n${OK_NEXT}`, true);
   if (!closed) watchClose();
 }
 
@@ -105,7 +106,7 @@ async function watchClose() {
     try {
       const s = await bridge.apiGet('login/state');
       if (!s || s.closed === true || s.status === 'idle' || s.status === 'closed') {
-        ovDesc.textContent = `${okMsg}\n服务器上的浏览器已经关了，这一页可以关掉了。`;
+        ovDesc.textContent = `${okMsg}\n${OK_DONE}\n${OK_NEXT}`;
         return;
       }
     } catch (_) {

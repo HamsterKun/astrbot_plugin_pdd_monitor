@@ -20,12 +20,6 @@
         "description": "出口代理",
         "default": "",
         "hint": "留空直连。云服务器上必填。格式 socks5h://user:pass@host:port"
-      },
-      "login_allow_group": {
-        "type": "bool",
-        "description": "群里允许扫码",
-        "default": false,
-        "hint": "群里要扫码时打开。别人扫了会把号绑到这台机器上，默认关闭。"
       }
     }
   },

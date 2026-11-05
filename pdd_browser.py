@@ -60,24 +60,6 @@ SEARCH_URL = "https://mobile.yangkeduo.com/search_result.html"
 HOME_URL = "https://mobile.yangkeduo.com/"
 LOGIN_URL = "https://mobile.yangkeduo.com/login.html"
 
-# 登录页的二维码选择器，从窄到宽。桌面版点开「扫码登录」后弹出的结构是
-#   .qr-code-login-container > .qr-code-login-content > .qr-code-area
-#                                          > .qr-code-wrapper > .qr-code-inner
-# 真正的码在 `.qr-code-inner` 里（PDD 自己的扫码组件，canvas 或 img 都有可能）。
-# 全都不中时退回整页截图，用来留档。
-QR_SELECTORS = (
-    ".qr-code-inner",
-    ".qr-code-area",
-    ".qr-code-inner canvas",
-    ".qr-code-area canvas",
-    ".qr-code-inner img",
-    'img[src*="qrcode"]',
-    'canvas[class*="qr"]',
-    '[class*="qrcode"] img',
-    'img[alt*="二维码"]',
-    'img[src^="data:image"]',
-)
-
 # 「扫码登录」入口。桌面版是 React 现渲染的（body 一开始是空的），入口出现得晚，
 # 所以按选择器轮询，超时前一直等。class 名最稳，文案只在 class 改版时兜底。
 QR_ENTRY_SELS = (
@@ -159,73 +141,6 @@ QR_VIEW_JS = r"""
 }
 """
 
-# 扫码之后，拼多多有时会插一屏「安全验证」（让你从几个用过的收货地址/姓名里挑一个）。
-# 这一步只能人来判断，所以把选项抛给用户，等一个序号回来再点。
-VERIFY_HINTS = ("安全验证", "收货人姓名", "收货地址", "请选择您使用过的")
-
-# 安全验证提交后，等多久还没拿到登录态就判失败。
-# 卡住不动比报错更让人难受——用户会以为「没下文了」，只能干等 180 秒。
-POST_VERIFY_GRACE = 90.0
-
-# 把验证选项的文案读出来。优先原生 radio，读不到再按常见容器兜底；
-# 只取「宽一点、窄高度、文案不长」的块，避免把标题和按钮也当成选项。
-VERIFY_OPTIONS_JS = r"""
-() => {
-  const clean = (t) => (t || "").replace(/\s+/g, " ").trim();
-  const rows = [];
-  document.querySelectorAll('input[type="radio"]').forEach((el) => {
-    const row = el.closest("label") || el.parentElement || el;
-    rows.push(clean(row.innerText).slice(0, 30));
-  });
-  if (rows.length) return rows;
-  const seen = new Set();
-  const out = [];
-  document.querySelectorAll('[class*="option"], [class*="item"], li, [role="radio"]')
-    .forEach((e) => {
-      const r = e.getBoundingClientRect();
-      const t = clean(e.innerText).slice(0, 30);
-      if (r.width > 80 && r.height > 18 && r.height < 140 && t && !seen.has(t)) {
-        seen.add(t);
-        out.push(t);
-      }
-    });
-  return out.slice(0, 8);
-}
-"""
-
-# 点第 n 个选项，返回用哪种方式点中的
-VERIFY_CLICK_JS = r"""
-(n) => {
-  const clean = (t) => (t || "").replace(/\s+/g, " ").trim();
-  const ok = (e) => {
-    const r = e.getBoundingClientRect();
-    const t = clean(e.innerText);
-    return r.width > 80 && r.height > 18 && r.height < 140 && t && t.length <= 30;
-  };
-  const radios = [...document.querySelectorAll('input[type="radio"]')];
-  if (radios[n]) {
-    const row = radios[n].closest("label") || radios[n].parentElement || radios[n];
-    try { row.click(); } catch (e) {}
-    try { radios[n].click(); } catch (e) {}
-    return "radio";
-  }
-  const seen = new Set();
-  const picked = [];
-  document.querySelectorAll('[class*="option"], [class*="item"], li, [role="radio"]')
-    .forEach((e) => {
-      if (!ok(e)) return;
-      const t = clean(e.innerText).slice(0, 30);
-      if (seen.has(t)) return;
-      seen.add(t);
-      picked.push(e);
-    });
-  if (picked[n]) { picked[n].click(); return "row"; }
-  return "";
-}
-"""
-
-# 移动端环境三要素：iPhone UA + 440×956 视口 + is_mobile。少一个就会被判
-# 「系统繁忙」—— 用桌面 UA 去访问搜索页必定失败。
 IPHONE_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) "
              "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 "
              "Mobile/15E148 Safari/604.1")
@@ -377,7 +292,6 @@ def _brief(err: BaseException, limit: int = 120) -> str:
     """异常压成一行：Playwright 的报错动辄十几行带方框，塞进聊天窗口不合适。"""
     text = " ".join(str(err).split())
     return text if len(text) <= limit else text[: limit - 1] + "…"
-
 
 class BrowserError(RuntimeError):
     """取数失败，message 里带可读原因。"""
@@ -973,46 +887,6 @@ class BrowserFetcher:
         except Exception as e:
             self._log(f"资源拦截没挂上（继续取数）：{e}")
 
-    async def login_qr(self, on_qr, timeout: float = 180.0,
-                       refresh_after: float = 95.0, on_miss=None,
-                       ask=None) -> dict:
-        """开登录页，把二维码交给 on_qr 发出去，再等用户扫码。
-
-        on_qr(png: bytes, how: str) 每次拿到一张新二维码时调用一次。二维码会过期，
-        所以隔一段时间重截一张再发，比让用户对着失效的码干等强。
-
-        on_miss(html: str) 只在「选择器一个都没命中、只能退回整页截图」时调用一次，
-        用来把页面源码留档——否则没法把选择器对准，只能靠猜。
-
-        ask(png, options) -> int 用于扫码后的「安全验证」：那一步要人判断（比如从
-        几个用过的收货人姓名里挑一个），所以把截图和选项交给会话，等一个序号回来
-        再点。不传就当作没人能答，遇到验证直接报错。
-
-        返回 {"cookie": "k=v; ...", "count": n, "fields": [...]}。
-        超时抛 BrowserError，由调用方决定怎么提示。
-
-        这里**不注入现有账号 cookie**：登录流程要能换号，带着旧凭证进去会直接
-        跳过登录页（或者显示已登录）。设备 cookie 靠预热首页拿，不影响换号。
-
-        退出时一定把浏览器关掉（见 finally）：登录是一次性的事，留着没有意义。
-        登录页本身很重——一直在跑轮询、埋点、动态图，一个这样的页面就能占掉
-        几百兆，而且 Chromium 关页面不还内存。之前这条路径失败后浏览器就这么
-        挂在内存里，连试几次就把机器吃满了。
-        """
-        async with self._lock:
-            try:
-                await self._maybe_recycle()
-                await self.start()
-                return await self._login_locked(on_qr, timeout, refresh_after,
-                                                on_miss, ask)
-            finally:
-                try:
-                    await self._release_now()
-                except asyncio.CancelledError:
-                    raise
-                except BaseException as e:      # noqa: BLE001 - 收尾不能盖掉原错误
-                    self._log(f"登录结束关浏览器失败：{e}")
-
     async def _open_login_page(self, page) -> None:
         """打开登录页。
 
@@ -1066,181 +940,6 @@ class BrowserFetcher:
     async def _ensure_qr_visible(self, page) -> bool:
         """把二维码滚进画面（WebUI 那条路要按 fetcher 调用，这里留个薄壳）。"""
         return await ensure_qr_visible(page, self._log)
-
-    async def _login_locked(self, on_qr, timeout: float, refresh_after: float,
-                            on_miss=None, ask=None) -> dict:
-        ctx = None
-        page = None
-        sent_at = 0.0
-        shots = 0
-        verifies = 0
-        try:
-            # 桌面形态：只有桌面 UA 的登录页才有「扫码登录」这个入口
-            ctx = await self._new_context(mobile=False)
-            # 设备 cookie（api_uid 等）还是要的：没有它登录页本身也可能不渲染
-            if self.warm_home and not self._home_warmed:
-                await self._warm_context(ctx)
-
-            page = await ctx.new_page()
-            await page.add_init_script(STEALTH_DESKTOP_JS)
-            await self._open_login_page(page)
-            # 等入口渲染出来再点，点开再等二维码画出来。给的时间比一次普通导航宽，
-            # 因为 JS 包要走代理下载；真等不到就立刻报，别让用户干等 180 秒。
-            switched = await self._switch_to_qr_tab(
-                page, timeout=min(max(15.0, self.timeout), 40.0), popup_timeout=15.0)
-            if not switched:
-                if on_miss is not None:
-                    try:
-                        await on_miss(await page.content())
-                    except Exception as e:
-                        self._log(f"存登录页快照失败：{e}")
-                raise BrowserError(
-                    "没找到「扫码登录」入口｜登录页没渲染出这个按钮，多为 JS 资源没加载完"
-                    "（出口慢或被拦）｜重发 /盯价 login，仍不行把 browser_timeout 调大"
-                )
-
-            loop = asyncio.get_event_loop()
-            deadline = loop.time() + timeout
-            verify_at = 0.0
-            while loop.time() < deadline:
-                header, fields = await self._logged_cookie(ctx)
-                if header:
-                    self._log(f"扫码登录成功，拿到 {len(fields)} 个字段")
-                    return {"cookie": header, "count": len(fields), "fields": fields}
-
-                # 扫码之后常插一屏「安全验证」。这一步要人判断，题目交给会话，
-                # 等一个序号回来再点；点完接着轮询 cookie。
-                if await self._is_verify_panel(page):
-                    if verifies >= 3:
-                        raise BrowserError(
-                            "验证没通过｜连续三轮都没被接受，或被风控按住了｜"
-                            "重发 /盯价 login，不行就改用手工复制 Cookie"
-                        )
-                    verifies += 1
-                    before = loop.time()
-                    await self._solve_verify(page, ask)
-                    # 等人回话花掉的时间不算进「扫码超时」，否则刚点完就判超时
-                    deadline += max(0.0, loop.time() - before) + 2.0
-                    verify_at = loop.time()
-                    continue
-
-                # 验证提交后迟迟拿不到登录态：九成是选错了，或者后面还藏着一道。
-                # 不能就这么干等到 180 秒，用户会觉得「没下文」。
-                if verify_at and (loop.time() - verify_at) > POST_VERIFY_GRACE:
-                    excerpt = await self._page_excerpt(page)
-                    raise BrowserError(
-                        f"验证已提交，但没拿到登录态｜可能选错了，或后面还有一道验证｜"
-                        f"页面现在是「{excerpt}」｜重发 /盯价 login"
-                    )
-
-                # 已经进过验证环节就别再发「二维码刷新」了：码那一步过去了
-                if not verifies and (shots == 0 or (loop.time() - sent_at) >= refresh_after):
-                    png, how = await self._grab_qr(page)
-                    if png and how == "整页" and shots == 0:
-                        # 整页说明没抠到二维码。再等一拍看是不是还在渲染
-                        if await _wait_qr_ready(page, 3.0):
-                            png2, how2 = await self._grab_qr(page)
-                            if png2 and how2 != "整页":
-                                png, how = png2, how2
-                    if png:
-                        # 退回整页截图说明选择器没命中，留一份源码好把选择器对准
-                        if how == "整页" and shots == 0 and on_miss is not None:
-                            try:
-                                await on_miss(await page.content())
-                            except Exception as e:
-                                self._log(f"存登录页快照失败：{e}")
-                        await on_qr(png, how)
-                        shots += 1
-                        sent_at = loop.time()
-                        self._log(f"二维码已截（{how}），等扫码")
-                await asyncio.sleep(2.0)
-
-            raise BrowserError(
-                f"扫码登录超时｜{int(timeout)} 秒内没扫，或二维码已过期｜"
-                "重发 /盯价 login 换个新码"
-            )
-        finally:
-            await self._close_quietly(page)
-            await self._close_quietly(ctx)
-            self._last_used = time.time()
-
-    @staticmethod
-    async def _is_verify_panel(page) -> bool:
-        """当前页面是不是那屏「安全验证」。
-
-        扫完码、风控觉得这台设备眼生时会出现，题目一般是「选择您使用过的收货人
-        姓名」。只能人来答，所以认出来之后要把题目抛给会话。
-        """
-        try:
-            text = await page.evaluate(
-                "() => (document.body && document.body.innerText) || ''")
-        except Exception:
-            return False
-        return any(h in (text or "") for h in VERIFY_HINTS)
-
-    @staticmethod
-    async def _page_excerpt(page, limit: int = 70) -> str:
-        """页面上一屏文字的前几十个字，用来在回执里说明「现在停在哪一页」。"""
-        try:
-            text = await page.evaluate(
-                "() => (document.body && document.body.innerText) || ''")
-        except Exception:
-            return "读不到页面内容"
-        clean = " ".join((text or "").split())
-        if not clean:
-            return "页面是空的"
-        return clean[:limit] + ("…" if len(clean) > limit else "")
-
-    async def _solve_verify(self, page, ask) -> None:
-        """把验证题目发出去，等用户选一个序号，点它、再点确认。"""
-        if ask is None:
-            raise BrowserError(
-                "扫码后要做安全验证｜这步需要人来选，当前会话没法交互｜"
-                "这次先改用方式二手工复制 Cookie"
-            )
-
-        options: list[str] = []
-        try:
-            for item in await page.evaluate(VERIFY_OPTIONS_JS) or []:
-                text = str(item or "").strip()
-                if text and text not in options:
-                    options.append(text[:30])
-        except Exception:
-            pass
-
-        try:
-            png = await page.screenshot(type="png")
-        except Exception:
-            png = b""
-
-        idx = await ask(png, options[:8])
-        if idx is None or int(idx) < 0:
-            raise BrowserError("安全验证已取消｜重发 /盯价 login 再来一次")
-
-        try:
-            how = await page.evaluate(VERIFY_CLICK_JS, int(idx))
-        except Exception as e:
-            raise BrowserError(f"点不动验证选项｜{_brief(e)}") from e
-        if not how:
-            raise BrowserError(
-                "点不动验证选项｜页面结构和预期不同｜这次先改用方式二手工复制 Cookie"
-            )
-        self._log(f"已选中第 {int(idx) + 1} 项（{how}），点确认")
-        await asyncio.sleep(0.4)
-
-        clicked = False
-        for label in ("确认", "确定", "提交", "下一步"):
-            try:
-                loc = page.get_by_text(label, exact=True).first
-                if await loc.count():
-                    await loc.click(timeout=3000)
-                    clicked = True
-                    break
-            except Exception:
-                continue
-        if not clicked:
-            self._log("没找到「确认」按钮，按页面当前状态继续")
-        await asyncio.sleep(2.0)
 
     @staticmethod
     async def _logged_cookie(ctx) -> tuple[str, list[str]]:
