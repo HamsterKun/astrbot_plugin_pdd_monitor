@@ -1,7 +1,7 @@
 name: astrbot_plugin_pdd_monitor
 display_name: 多多盯价
 desc: 用关键词盯拼多多感兴趣的商品的最低价，跌破历史最低价时主动推送到群；群内 @机器人 说「今日行情」查看全部监控项的现价与涨跌。BUG/技术支持联系：QQ：2676212264（邮箱同）；Github：https://github.com/HamsterKun/astrbot_plugin_pdd_monitor/issues
-version: v4.6.5
+version: v4.6.6
 author: Hamster
 repo: "https://github.com/HamsterKun/astrbot_plugin_pdd_monitor"
 astrbot_version: ">=4.24.2"
