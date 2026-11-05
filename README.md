@@ -9,6 +9,12 @@
 | 依赖     | `playwright`（含 Chromium 内核）、`jieba`、`httpx`、`curl_cffi` |
 | AstrBot | ≥ 4.24.2                                                |
 
+**BUG/技术支持联系：**
+
+QQ：2676212264（邮箱同）
+
+Github：https://github.com/HamsterKun/astrbot_plugin_pdd_monitor/issues
+
 ---
 
 ## 快速上手
