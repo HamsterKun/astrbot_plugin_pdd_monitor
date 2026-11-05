@@ -58,6 +58,171 @@ log = get_logger()
 
 SEARCH_URL = "https://mobile.yangkeduo.com/search_result.html"
 HOME_URL = "https://mobile.yangkeduo.com/"
+LOGIN_URL = "https://mobile.yangkeduo.com/login.html"
+
+# 登录页的二维码选择器，从窄到宽。桌面版点开「扫码登录」后弹出的结构是
+#   .qr-code-login-container > .qr-code-login-content > .qr-code-area
+#                                          > .qr-code-wrapper > .qr-code-inner
+# 真正的码在 `.qr-code-inner` 里（PDD 自己的扫码组件，canvas 或 img 都有可能）。
+# 全都不中时退回整页截图，用来留档。
+QR_SELECTORS = (
+    ".qr-code-inner",
+    ".qr-code-area",
+    ".qr-code-inner canvas",
+    ".qr-code-area canvas",
+    ".qr-code-inner img",
+    'img[src*="qrcode"]',
+    'canvas[class*="qr"]',
+    '[class*="qrcode"] img',
+    'img[alt*="二维码"]',
+    'img[src^="data:image"]',
+)
+
+# 「扫码登录」入口。桌面版是 React 现渲染的（body 一开始是空的），入口出现得晚，
+# 所以按选择器轮询，超时前一直等。class 名最稳，文案只在 class 改版时兜底。
+QR_ENTRY_SELS = (
+    "div.qrcode-login",
+    ".login-box .qrcode-login",
+    "text=扫码登录",
+    "text=扫一扫",
+    "text=二维码登录",
+)
+
+# 点开入口后，这些元素出现就说明二维码弹层出来了
+QR_READY_SELS = (".qr-code-inner", ".qr-code-area", ".qr-code-login-container")
+
+# 登录页视口高度：至少 900（默认的 720 装不下那套「logo + 说明 + 二维码」），
+# 页面更高就按页面高度撑开，最多 1200。
+#
+# 为什么不是「页面多高就多高」：有的页面用 100vh 布局，scrollHeight 恒等于视口高，
+# 那种页面在 720 下就是把二维码压出屏幕，撑到 900 才装得下。
+LOGIN_MIN_VIEWPORT_H = 900
+LOGIN_MAX_VIEWPORT_H = 1200
+
+# 页面实际有多高（含滚动部分）。
+PAGE_HEIGHT_JS = r"""
+() => {
+  const de = document.documentElement;
+  const b = document.body;
+  return Math.max(
+    de ? de.scrollHeight : 0,
+    b ? b.scrollHeight : 0,
+    b ? b.offsetHeight : 0
+  );
+}
+"""
+
+# 把二维码摆进画面。
+#
+# 为什么需要：登录页比视口高时，二维码常常压在下沿之外，而截图截的是视口，
+# 于是推给面板的画面里只有半张码——手机根本扫不了。
+#
+# 三层兜底：
+#   1) 已知的几个类名，取「面积最小」的那个——弹层容器往往包着整页，滚它等于没滚；
+#   2) 类名全没命中时，找页面上最大的正方形 canvas/img。二维码就是方的，
+#      登录页上不会有第二个这么大的正方块；
+#   3) 还找不到就返回 ok:false，调用方会记日志，别再不声不响。
+QR_VIEW_JS = r"""
+() => {
+  const sels = ['.qr-code-inner', '.qr-code-area canvas', '.qr-code-area img',
+                '.qr-code-area', '.qr-code-wrapper', '.qr-code-login-container'];
+  const cands = [];
+  for (const s of sels) {
+    for (const el of document.querySelectorAll(s)) {
+      const r = el.getBoundingClientRect();
+      if (!r || r.width < 40 || r.height < 40) continue;
+      cands.push({ sel: s, r: r });
+    }
+  }
+  if (!cands.length) {
+    for (const el of document.querySelectorAll('canvas, img')) {
+      const r = el.getBoundingClientRect();
+      if (!r || r.width < 80 || r.height < 80) continue;
+      if (Math.abs(r.width - r.height) > r.width * 0.2) continue;
+      cands.push({ sel: '正方块兜底', r: r, score: -r.width });
+    }
+  }
+  if (!cands.length) return { ok: false };
+  cands.sort((a, b) => a.r.width * a.r.height - b.r.width * b.r.height);
+  const c = cands[0];
+  const pageY = c.r.top + window.scrollY;
+  const top = c.r.height > window.innerHeight - 24
+    ? pageY - 12
+    : pageY - (window.innerHeight - c.r.height) / 2;
+  window.scrollTo(0, Math.max(0, Math.round(top)));
+  return {
+    ok: true, sel: c.sel,
+    h: Math.round(c.r.height),
+    vh: window.innerHeight,
+    y: Math.round(window.scrollY),
+  };
+}
+"""
+
+# 扫码之后，拼多多有时会插一屏「安全验证」（让你从几个用过的收货地址/姓名里挑一个）。
+# 这一步只能人来判断，所以把选项抛给用户，等一个序号回来再点。
+VERIFY_HINTS = ("安全验证", "收货人姓名", "收货地址", "请选择您使用过的")
+
+# 安全验证提交后，等多久还没拿到登录态就判失败。
+# 卡住不动比报错更让人难受——用户会以为「没下文了」，只能干等 180 秒。
+POST_VERIFY_GRACE = 90.0
+
+# 把验证选项的文案读出来。优先原生 radio，读不到再按常见容器兜底；
+# 只取「宽一点、窄高度、文案不长」的块，避免把标题和按钮也当成选项。
+VERIFY_OPTIONS_JS = r"""
+() => {
+  const clean = (t) => (t || "").replace(/\s+/g, " ").trim();
+  const rows = [];
+  document.querySelectorAll('input[type="radio"]').forEach((el) => {
+    const row = el.closest("label") || el.parentElement || el;
+    rows.push(clean(row.innerText).slice(0, 30));
+  });
+  if (rows.length) return rows;
+  const seen = new Set();
+  const out = [];
+  document.querySelectorAll('[class*="option"], [class*="item"], li, [role="radio"]')
+    .forEach((e) => {
+      const r = e.getBoundingClientRect();
+      const t = clean(e.innerText).slice(0, 30);
+      if (r.width > 80 && r.height > 18 && r.height < 140 && t && !seen.has(t)) {
+        seen.add(t);
+        out.push(t);
+      }
+    });
+  return out.slice(0, 8);
+}
+"""
+
+# 点第 n 个选项，返回用哪种方式点中的
+VERIFY_CLICK_JS = r"""
+(n) => {
+  const clean = (t) => (t || "").replace(/\s+/g, " ").trim();
+  const ok = (e) => {
+    const r = e.getBoundingClientRect();
+    const t = clean(e.innerText);
+    return r.width > 80 && r.height > 18 && r.height < 140 && t && t.length <= 30;
+  };
+  const radios = [...document.querySelectorAll('input[type="radio"]')];
+  if (radios[n]) {
+    const row = radios[n].closest("label") || radios[n].parentElement || radios[n];
+    try { row.click(); } catch (e) {}
+    try { radios[n].click(); } catch (e) {}
+    return "radio";
+  }
+  const seen = new Set();
+  const picked = [];
+  document.querySelectorAll('[class*="option"], [class*="item"], li, [role="radio"]')
+    .forEach((e) => {
+      if (!ok(e)) return;
+      const t = clean(e.innerText).slice(0, 30);
+      if (seen.has(t)) return;
+      seen.add(t);
+      picked.push(e);
+    });
+  if (picked[n]) { picked[n].click(); return "row"; }
+  return "";
+}
+"""
 
 # 移动端环境三要素：iPhone UA + 440×956 视口 + is_mobile。少一个就会被判
 # 「系统繁忙」—— 用桌面 UA 去访问搜索页必定失败。
@@ -66,6 +231,19 @@ IPHONE_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) "
              "Mobile/15E148 Safari/604.1")
 
 VIEWPORT = {"width": 440, "height": 956}
+
+# 扫码登录只在「桌面端」渲染。登录页那段代码里写着：
+#   isPCPlatform && qrcodeLoginConfig.show && <div class="qrcode-login">扫码登录</div>
+# 拿 iPhone UA 进去，「扫码登录」这个入口根本不会出现——之前截到「手机登录」
+# 那一屏就是这个原因，不是选择器不准。
+DESKTOP_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+# 只求「像桌面」，不求大：视口越大，渲染进程要的位图越大。900×720 已经够摆下
+# 登录卡片和二维码弹层，配 2 倍缩放截出来的码也清楚。
+# 登录页的桌面视口。高度给到 900：720 装不下「logo + 说明 + 二维码」那一屏，
+# 二维码会被压出下沿，截出来的就是半张码。宽度不能降——「扫码登录」入口只
+# 在桌面布局下渲染。
+DESKTOP_VIEWPORT = {"width": 900, "height": 900}
 
 # 无头浏览器最好认的几个特征：webdriver 为 true、语言集不对、platform 是 Linux。
 # iOS 上 Safari 本来就没什么插件，所以只补这几项，不硬造 plugins 列表。
@@ -76,6 +254,19 @@ STEALTH_JS = r"""
     Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh'] });
     Object.defineProperty(navigator, 'platform', { get: () => 'iPhone' });
     Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 5 });
+  } catch (e) {}
+})();
+"""
+
+# 桌面形态的登录页要配套的指纹：上面那份把 platform 写成 iPhone，
+# 配 Windows UA 就是自相矛盾，而且「扫码登录」入口本来就按桌面端判断。
+STEALTH_DESKTOP_JS = r"""
+(() => {
+  try {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh'] });
+    Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+    Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0 });
   } catch (e) {}
 })();
 """
@@ -192,6 +383,85 @@ class BrowserError(RuntimeError):
     """取数失败，message 里带可读原因。"""
 
 
+async def _wait_qr_ready(page, timeout: float = 8.0) -> bool:
+    """等二维码本身出现（不是弹层外壳，是里面那个码）。
+
+    放模块级而不是方法：这个方法会被测试用假页面调用，不需要 fetcher 实例，
+    挂在 self 上反而多一层「self 有没有这个属性」的隐患。
+    """
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + max(0.2, timeout)
+    while True:
+        for sel in QR_READY_SELS:
+            try:
+                if await page.locator(sel).first.count():
+                    return True
+            except Exception:
+                pass
+        if loop.time() >= deadline:
+            return False
+        await asyncio.sleep(0.5)
+
+
+async def fit_viewport_to_page(page, log=None,
+                               max_h: int = LOGIN_MAX_VIEWPORT_H,
+                               min_h: int = LOGIN_MIN_VIEWPORT_H) -> int:
+    """把视口撑到能装下整页（不小于 min_h、不大于 max_h），返回新高度，失败返回 0。
+
+    比「滚到二维码」更彻底：滚动之后页面顶上那些内容就看不见了，而且一旦页面
+    重新渲染（切 tab、弹层加载完重排）滚动位置会被重置，用户下次取帧又是半张码。
+    撑高视口没有这些问题——整页都在画面里。
+
+    代价是这一帧的位图变大，只在登录会话期间，可以接受。
+    """
+    try:
+        h = await page.evaluate(PAGE_HEIGHT_JS)
+    except Exception as e:
+        if log is not None:
+            log(f"量页面高度失败（继续）：{_brief(e)}")
+        return 0
+    try:
+        h = int(h or 0)
+    except (TypeError, ValueError):
+        return 0
+    if h <= 0:
+        return 0
+    # 上下各留一点，别让最后一行贴着边；再跟下限取大
+    target = max(int(min_h), min(int(max_h), h + 8))
+    try:
+        await page.set_viewport_size(
+            {"width": int(DESKTOP_VIEWPORT["width"]), "height": target})
+    except Exception as e:
+        if log is not None:
+            log(f"调整视口高度失败（继续）：{_brief(e)}")
+        return 0
+    if log is not None:
+        log(f"登录页高 {h}，视口高度调到 {target}")
+    return target
+
+
+async def ensure_qr_visible(page, log=None) -> bool:
+    """把二维码滚进画面。
+
+    登录页比视口高（900×720 装不下整页），二维码常常压在下沿之外，截出来的
+    画面只有半张码——手机扫不了。这里按元素的真实位置算滚动量，比写死像素靠谱：
+    弹层高度、有没有顶部广告都说不准。
+
+    和 `_wait_qr_ready` 一样放模块级：会被假页面调用，不需要 fetcher 实例。
+    """
+    try:
+        res = await page.evaluate(QR_VIEW_JS)
+    except Exception as e:
+        if log is not None:
+            log(f"滚动到二维码失败（继续）：{_brief(e)}")
+        return False
+    if not isinstance(res, dict) or not res.get("ok"):
+        return False
+    if log is not None:
+        log(f"已把二维码滚到画面里（码高 {res.get('h')}，视口 {res.get('vh')}）")
+    return True
+
+
 def parse_cookie_header(raw: str) -> list[dict]:
     """把一整条 Cookie 头拆成 Playwright 认的 cookie 列表。"""
     text = (raw or "").strip().strip('"').strip()
@@ -266,6 +536,10 @@ class BrowserFetcher:
         self._last_used = 0.0
         self.recycled = 0          # 累计回收次数，供诊断显示
         self._home_warmed = False  # 本浏览器进程是否已访问过首页
+        # 上一轮有页面/上下文没关干净（关闭超时、进程卡住）。这种进程不能再信：
+        # 关不掉的渲染进程会把内存一直占着，下一轮直接换新的。
+        self._dirty = False
+        self._release_task = None  # 收尾任务的引用，取消场景下靠它跑完
 
     # ---------------------------------------------------------------- 生命周期
     def _log(self, msg: str) -> None:
@@ -342,6 +616,7 @@ class BrowserFetcher:
             raise
         # 新进程 = 新的浏览器存储，首页要重新访一次
         self._home_warmed = False
+        self._dirty = False
         self._log(f"浏览器已启动（headless={self.headless}"
                   f"{', channel=' + self.channel if self.channel else ''}）")
 
@@ -454,7 +729,12 @@ class BrowserFetcher:
         return conf
 
     async def close(self) -> None:
-        await self._shutdown_pw()
+        """外部收尾入口：插件重载、异常兜底都走这里。
+
+        用 `_release_now` 而不是直接 `_shutdown_pw`：调用点往往在取消/异常路径上，
+        直接 await 很可能半路被打断，进程就留下了。
+        """
+        await self._release_now()
 
     def _stop_relay(self) -> None:
         """收掉本地中继。
@@ -485,8 +765,34 @@ class BrowserFetcher:
                                        "browser closed",
                                        "browser disconnected"))
 
+    async def _close_quietly(self, obj, timeout: float = 8.0) -> bool:
+        """关页面、关上下文，都带超时。
+
+        `close()` 在页面还在导航、渲染进程卡死时会一直挂着：插件这头表现为
+        「巡检停在半路」，机器那头表现为「一个早就用完的页面关十分钟还在」。
+        超时就当它坏了，给浏览器记个脏标记，下一轮整个换掉——关不掉的进程
+        只能靠退出收尸。
+        """
+        if obj is None:
+            return True
+        try:
+            await asyncio.wait_for(obj.close(), timeout=timeout)
+            return True
+        except asyncio.CancelledError:
+            # 取消也要留下痕迹：这个页面大概率没关成
+            self._dirty = True
+            raise
+        except BaseException as e:      # noqa: BLE001 - 收尾不能抛
+            self._dirty = True
+            self._log(f"页面/上下文 {int(timeout)} 秒没关掉，下一轮换新进程：{_brief(e)}")
+            return False
+
     async def _shutdown_pw(self, timeout: float = 15.0) -> None:
-        """关掉浏览器、驱动、中继。三条路都要收干净，否则重载插件会攒进程。"""
+        """关掉浏览器、驱动、中继。三条路都要收干净，否则重载插件会攒进程。
+
+        每一步都吞掉 BaseException：这里多半是在异常路径上被调用的，收尾途中
+        再抛一次（比如协程已被取消），句柄就丢了，进程再没人管。
+        """
         browser, pw = self._browser, self._pw
         self._browser = None
         self._pw = None
@@ -494,15 +800,38 @@ class BrowserFetcher:
             try:
                 # close 在浏览器卡住时会一直挂着，插件重载就卡在这里
                 await asyncio.wait_for(browser.close(), timeout=timeout)
-            except Exception:
+            except BaseException:       # noqa: BLE001
                 pass
         if pw is not None:
             try:
                 # stop 会让 driver 退出，它下面的浏览器子进程随之被杀
                 await asyncio.wait_for(pw.stop(), timeout=5.0)
-            except Exception:
+            except BaseException:       # noqa: BLE001
                 pass
         self._stop_relay()
+        self._home_warmed = False
+        self._dirty = False
+
+    async def _release_now(self) -> None:
+        """立刻退掉浏览器，被取消也要退。
+
+        取消（插件重载、外层 wait_for 超时、任务被 abort）时，`finally` 里的
+        `await` 会立刻再抛一次 CancelledError，收尾动作走不完，Chromium 就留在
+        系统里了——这就解释了「明明报错了，内存却没降」。所以另起一个任务去收，
+        它不挂在当前协程上，取消也带不走。
+        """
+        if self._browser is None and self._pw is None and self._relay is None:
+            return
+        task = asyncio.ensure_future(self._shutdown_pw())
+        self._release_task = task
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # 让它在后台跑完；引用留在 self._release_task 上，不会被回收
+            task.add_done_callback(lambda t: t.cancelled() or t.exception())
+            raise
+        except BaseException:           # noqa: BLE001
+            pass
 
     async def _maybe_recycle(self) -> None:
         """判断该不该把整个浏览器进程换掉。
@@ -511,7 +840,14 @@ class BrowserFetcher:
         所以这里按「用得多」和「放得久」两个条件主动退一次：
           - 连续取数到 max_searches 次（一轮巡检里监控项多时会触发）
           - 距上次取数超过 idle_timeout 秒（巡检间隔 30 分钟，每轮开头必触发）
+        另外，上一轮有页面没关掉也直接换掉：那说明渲染进程已经卡住，留着只会涨。
         """
+        if self._dirty and self._browser is not None:
+            self._log("上一轮有页面没关干净，换一个新进程")
+            self.recycled += 1
+            await self._shutdown_pw()
+            self._searches = 0
+            return
         if self._browser is None:
             return
         reason = ""
@@ -586,6 +922,377 @@ class BrowserFetcher:
                 self._searches += 1
                 self._last_used = time.time()
 
+    # ---------------------------------------------------------------- 扫码登录
+    async def _new_context(self, mobile: bool = True):
+        """新建上下文：UA、视口、语言、时区都得像一台真设备。
+
+        mobile=False 给扫码登录用：桌面 UA 才会渲染「扫码登录」入口，这也是
+        整条登录路唯一能拿到二维码的姿势。
+        """
+        return await self._browser.new_context(
+            user_agent=self.user_agent if mobile else DESKTOP_UA,
+            viewport=VIEWPORT if mobile else DESKTOP_VIEWPORT,
+            device_scale_factor=3 if mobile else 2,   # 桌面 2 倍，二维码够清楚又不臃肿
+            is_mobile=mobile,
+            has_touch=mobile,
+            locale="zh-CN",
+            timezone_id="Asia/Shanghai",
+        )
+
+    async def _inject_cookies(self, ctx) -> None:
+        cookies = parse_cookie_header(self.cookie)
+        if not cookies:
+            return
+        try:
+            await ctx.add_cookies(cookies)
+        except Exception as e:
+            self._log(f"注入 cookie 失败（继续跑）：{e}")
+
+    async def _block_heavy(self, ctx) -> None:
+        """搜索页不下载图片、字体、音视频。
+
+        取数靠的是页面里那段 JSON，缩略图纯粹是负担：一屏几十张，每张解码后
+        都是几 MB 的位图，Chromium 关页面也不还，全靠进程退出回收。拦掉之后
+        单个渲染进程的内存能降一大截，顺带省流量、跑得更快。
+
+        只给取数用；登录页要显示二维码，不能拦。
+        """
+        heavy = {"image", "media", "font"}
+
+        async def route(r):
+            try:
+                if r.request.resource_type in heavy:
+                    await r.abort()
+                else:
+                    await r.continue_()
+            except Exception:
+                pass
+
+        try:
+            await ctx.route("**/*", route)
+        except Exception as e:
+            self._log(f"资源拦截没挂上（继续取数）：{e}")
+
+    async def login_qr(self, on_qr, timeout: float = 180.0,
+                       refresh_after: float = 95.0, on_miss=None,
+                       ask=None) -> dict:
+        """开登录页，把二维码交给 on_qr 发出去，再等用户扫码。
+
+        on_qr(png: bytes, how: str) 每次拿到一张新二维码时调用一次。二维码会过期，
+        所以隔一段时间重截一张再发，比让用户对着失效的码干等强。
+
+        on_miss(html: str) 只在「选择器一个都没命中、只能退回整页截图」时调用一次，
+        用来把页面源码留档——否则没法把选择器对准，只能靠猜。
+
+        ask(png, options) -> int 用于扫码后的「安全验证」：那一步要人判断（比如从
+        几个用过的收货人姓名里挑一个），所以把截图和选项交给会话，等一个序号回来
+        再点。不传就当作没人能答，遇到验证直接报错。
+
+        返回 {"cookie": "k=v; ...", "count": n, "fields": [...]}。
+        超时抛 BrowserError，由调用方决定怎么提示。
+
+        这里**不注入现有账号 cookie**：登录流程要能换号，带着旧凭证进去会直接
+        跳过登录页（或者显示已登录）。设备 cookie 靠预热首页拿，不影响换号。
+
+        退出时一定把浏览器关掉（见 finally）：登录是一次性的事，留着没有意义。
+        登录页本身很重——一直在跑轮询、埋点、动态图，一个这样的页面就能占掉
+        几百兆，而且 Chromium 关页面不还内存。之前这条路径失败后浏览器就这么
+        挂在内存里，连试几次就把机器吃满了。
+        """
+        async with self._lock:
+            try:
+                await self._maybe_recycle()
+                await self.start()
+                return await self._login_locked(on_qr, timeout, refresh_after,
+                                                on_miss, ask)
+            finally:
+                try:
+                    await self._release_now()
+                except asyncio.CancelledError:
+                    raise
+                except BaseException as e:      # noqa: BLE001 - 收尾不能盖掉原错误
+                    self._log(f"登录结束关浏览器失败：{e}")
+
+    async def _open_login_page(self, page) -> None:
+        """打开登录页。
+
+        只等「导航提交」不等 DOM：桌面版这个页面正文是空的，全靠 JS 现渲染，
+        等 load 或 domcontentloaded 都可能卡在埋点上。页面拿到手就行，
+        正文什么时候出来交给 `_switch_to_qr_tab` 去轮询。
+        """
+        try:
+            await page.goto(LOGIN_URL, wait_until="commit",
+                            timeout=self.timeout * 1000)
+        except Exception as e:
+            raise BrowserError(
+                f"打开登录页失败｜{int(self.timeout)} 秒内导航都没提交，多为出口太慢或不通｜"
+                f"{_brief(e)}"
+            ) from e
+        try:
+            await page.wait_for_load_state("domcontentloaded",
+                                           timeout=min(self.timeout, 20.0) * 1000)
+        except Exception as e:
+            self._log(f"登录页正文没在预期内就绪（继续）：{_brief(e)}")
+
+    async def _switch_to_qr_tab(self, page, timeout: float = 25.0,
+                                popup_timeout: float = 8.0) -> bool:
+        """点开「扫码登录」，等二维码弹层出来。
+
+        两个坑都在这里：
+          1) 入口是 React 现渲染的。桌面版 body 一开始完全空，脚本跑完才有内容，
+             所以不能「查一次没有就放弃」，得等到期限。
+          2) 点开之后二维码还要再请求一次才画出来（`.qr-code-inner` 里是 PDD 自己的
+             扫码组件），点完立刻截图通常是一块「二维码加载中」的遮罩。
+        """
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + max(1.0, timeout)
+        while loop.time() < deadline:
+            for sel in QR_ENTRY_SELS:
+                try:
+                    loc = page.locator(sel).first
+                    if not await loc.count():
+                        continue
+                    await loc.click(timeout=2000)
+                    self._log(f"已点开扫码登录（{sel}）")
+                    if await _wait_qr_ready(page, popup_timeout):
+                        await ensure_qr_visible(page, self._log)
+                        return True
+                except Exception:
+                    continue
+            await asyncio.sleep(1.0)
+        self._log("没等到「扫码登录」入口")
+        return False
+
+    async def _ensure_qr_visible(self, page) -> bool:
+        """把二维码滚进画面（WebUI 那条路要按 fetcher 调用，这里留个薄壳）。"""
+        return await ensure_qr_visible(page, self._log)
+
+    async def _login_locked(self, on_qr, timeout: float, refresh_after: float,
+                            on_miss=None, ask=None) -> dict:
+        ctx = None
+        page = None
+        sent_at = 0.0
+        shots = 0
+        verifies = 0
+        try:
+            # 桌面形态：只有桌面 UA 的登录页才有「扫码登录」这个入口
+            ctx = await self._new_context(mobile=False)
+            # 设备 cookie（api_uid 等）还是要的：没有它登录页本身也可能不渲染
+            if self.warm_home and not self._home_warmed:
+                await self._warm_context(ctx)
+
+            page = await ctx.new_page()
+            await page.add_init_script(STEALTH_DESKTOP_JS)
+            await self._open_login_page(page)
+            # 等入口渲染出来再点，点开再等二维码画出来。给的时间比一次普通导航宽，
+            # 因为 JS 包要走代理下载；真等不到就立刻报，别让用户干等 180 秒。
+            switched = await self._switch_to_qr_tab(
+                page, timeout=min(max(15.0, self.timeout), 40.0), popup_timeout=15.0)
+            if not switched:
+                if on_miss is not None:
+                    try:
+                        await on_miss(await page.content())
+                    except Exception as e:
+                        self._log(f"存登录页快照失败：{e}")
+                raise BrowserError(
+                    "没找到「扫码登录」入口｜登录页没渲染出这个按钮，多为 JS 资源没加载完"
+                    "（出口慢或被拦）｜重发 /盯价 login，仍不行把 browser_timeout 调大"
+                )
+
+            loop = asyncio.get_event_loop()
+            deadline = loop.time() + timeout
+            verify_at = 0.0
+            while loop.time() < deadline:
+                header, fields = await self._logged_cookie(ctx)
+                if header:
+                    self._log(f"扫码登录成功，拿到 {len(fields)} 个字段")
+                    return {"cookie": header, "count": len(fields), "fields": fields}
+
+                # 扫码之后常插一屏「安全验证」。这一步要人判断，题目交给会话，
+                # 等一个序号回来再点；点完接着轮询 cookie。
+                if await self._is_verify_panel(page):
+                    if verifies >= 3:
+                        raise BrowserError(
+                            "验证没通过｜连续三轮都没被接受，或被风控按住了｜"
+                            "重发 /盯价 login，不行就改用手工复制 Cookie"
+                        )
+                    verifies += 1
+                    before = loop.time()
+                    await self._solve_verify(page, ask)
+                    # 等人回话花掉的时间不算进「扫码超时」，否则刚点完就判超时
+                    deadline += max(0.0, loop.time() - before) + 2.0
+                    verify_at = loop.time()
+                    continue
+
+                # 验证提交后迟迟拿不到登录态：九成是选错了，或者后面还藏着一道。
+                # 不能就这么干等到 180 秒，用户会觉得「没下文」。
+                if verify_at and (loop.time() - verify_at) > POST_VERIFY_GRACE:
+                    excerpt = await self._page_excerpt(page)
+                    raise BrowserError(
+                        f"验证已提交，但没拿到登录态｜可能选错了，或后面还有一道验证｜"
+                        f"页面现在是「{excerpt}」｜重发 /盯价 login"
+                    )
+
+                # 已经进过验证环节就别再发「二维码刷新」了：码那一步过去了
+                if not verifies and (shots == 0 or (loop.time() - sent_at) >= refresh_after):
+                    png, how = await self._grab_qr(page)
+                    if png and how == "整页" and shots == 0:
+                        # 整页说明没抠到二维码。再等一拍看是不是还在渲染
+                        if await _wait_qr_ready(page, 3.0):
+                            png2, how2 = await self._grab_qr(page)
+                            if png2 and how2 != "整页":
+                                png, how = png2, how2
+                    if png:
+                        # 退回整页截图说明选择器没命中，留一份源码好把选择器对准
+                        if how == "整页" and shots == 0 and on_miss is not None:
+                            try:
+                                await on_miss(await page.content())
+                            except Exception as e:
+                                self._log(f"存登录页快照失败：{e}")
+                        await on_qr(png, how)
+                        shots += 1
+                        sent_at = loop.time()
+                        self._log(f"二维码已截（{how}），等扫码")
+                await asyncio.sleep(2.0)
+
+            raise BrowserError(
+                f"扫码登录超时｜{int(timeout)} 秒内没扫，或二维码已过期｜"
+                "重发 /盯价 login 换个新码"
+            )
+        finally:
+            await self._close_quietly(page)
+            await self._close_quietly(ctx)
+            self._last_used = time.time()
+
+    @staticmethod
+    async def _is_verify_panel(page) -> bool:
+        """当前页面是不是那屏「安全验证」。
+
+        扫完码、风控觉得这台设备眼生时会出现，题目一般是「选择您使用过的收货人
+        姓名」。只能人来答，所以认出来之后要把题目抛给会话。
+        """
+        try:
+            text = await page.evaluate(
+                "() => (document.body && document.body.innerText) || ''")
+        except Exception:
+            return False
+        return any(h in (text or "") for h in VERIFY_HINTS)
+
+    @staticmethod
+    async def _page_excerpt(page, limit: int = 70) -> str:
+        """页面上一屏文字的前几十个字，用来在回执里说明「现在停在哪一页」。"""
+        try:
+            text = await page.evaluate(
+                "() => (document.body && document.body.innerText) || ''")
+        except Exception:
+            return "读不到页面内容"
+        clean = " ".join((text or "").split())
+        if not clean:
+            return "页面是空的"
+        return clean[:limit] + ("…" if len(clean) > limit else "")
+
+    async def _solve_verify(self, page, ask) -> None:
+        """把验证题目发出去，等用户选一个序号，点它、再点确认。"""
+        if ask is None:
+            raise BrowserError(
+                "扫码后要做安全验证｜这步需要人来选，当前会话没法交互｜"
+                "这次先改用方式二手工复制 Cookie"
+            )
+
+        options: list[str] = []
+        try:
+            for item in await page.evaluate(VERIFY_OPTIONS_JS) or []:
+                text = str(item or "").strip()
+                if text and text not in options:
+                    options.append(text[:30])
+        except Exception:
+            pass
+
+        try:
+            png = await page.screenshot(type="png")
+        except Exception:
+            png = b""
+
+        idx = await ask(png, options[:8])
+        if idx is None or int(idx) < 0:
+            raise BrowserError("安全验证已取消｜重发 /盯价 login 再来一次")
+
+        try:
+            how = await page.evaluate(VERIFY_CLICK_JS, int(idx))
+        except Exception as e:
+            raise BrowserError(f"点不动验证选项｜{_brief(e)}") from e
+        if not how:
+            raise BrowserError(
+                "点不动验证选项｜页面结构和预期不同｜这次先改用方式二手工复制 Cookie"
+            )
+        self._log(f"已选中第 {int(idx) + 1} 项（{how}），点确认")
+        await asyncio.sleep(0.4)
+
+        clicked = False
+        for label in ("确认", "确定", "提交", "下一步"):
+            try:
+                loc = page.get_by_text(label, exact=True).first
+                if await loc.count():
+                    await loc.click(timeout=3000)
+                    clicked = True
+                    break
+            except Exception:
+                continue
+        if not clicked:
+            self._log("没找到「确认」按钮，按页面当前状态继续")
+        await asyncio.sleep(2.0)
+
+    @staticmethod
+    async def _logged_cookie(ctx) -> tuple[str, list[str]]:
+        """从上下文里取登录后的 cookie。有 PDDAccessToken 才算登录成功。"""
+        try:
+            items = await ctx.cookies()
+        except Exception:
+            return "", []
+        pairs = {c["name"]: c.get("value", "") for c in items or [] if c.get("name")}
+        token = pairs.get("PDDAccessToken", "")
+        if not token:
+            return "", []
+        fields = list(pairs)
+        header = "; ".join(f"{k}={v}" for k, v in pairs.items())
+        return header, fields
+
+    @staticmethod
+    async def _grab_qr(page) -> tuple[bytes, str]:
+        """截二维码，返回 (png, 用的哪种方式)。
+
+        点开弹层后二维码还要再请求一次才画出来，中间是「二维码加载中」的遮罩。
+        所以先专门等 `.qr-code-inner`（码本身），等不到才往下退；退到外壳
+        `.qr-code-area` 时还要确认没有遮罩，免得把「加载中」当成码发出去。
+        全都不中退回整页截图，二维码在中间，用户照样扫得到，比报错强。
+        """
+        try:
+            await page.locator(".qr-code-inner").first.wait_for(
+                state="visible", timeout=10000)
+        except Exception:
+            pass
+        for sel in QR_SELECTORS:
+            try:
+                loc = page.locator(sel).first
+                await loc.wait_for(state="visible", timeout=2000)
+                box = await loc.bounding_box()
+                if not box or box.get("width", 0) < 60:
+                    continue
+                if not sel.endswith(".qr-code-inner"):
+                    # 外壳里可能正盖着「加载中/已失效」的遮罩
+                    mask = page.locator(".qr-code-area .qr-code-mask").first
+                    if await mask.count():
+                        continue
+                png = await loc.screenshot(type="png")
+                if png and len(png) > 800:
+                    return png, sel
+            except Exception:
+                continue
+        try:
+            return await page.screenshot(type="png"), "整页"
+        except Exception as e:
+            raise BrowserError(f"截二维码失败｜页面可能已被关闭｜{_brief(e)}") from e
+
     async def _warm_context(self, ctx) -> None:
         """用一张临时页访问首页，让服务端下发设备 cookie。
 
@@ -604,30 +1311,15 @@ class BrowserFetcher:
             self._log(f"首页预热失败（继续取数）：{e}")
         finally:
             if page is not None:
-                try:
-                    await page.close()
-                except Exception:
-                    pass
+                await self._close_quietly(page)
 
     async def _search_locked(self, url: str, keyword: str) -> dict:
         ctx = None
         page = None
         try:
-            ctx = await self._browser.new_context(
-                user_agent=self.user_agent,
-                viewport=VIEWPORT,
-                device_scale_factor=3,
-                is_mobile=True,
-                has_touch=True,
-                locale="zh-CN",
-                timezone_id="Asia/Shanghai",
-            )
-            cookies = parse_cookie_header(self.cookie)
-            if cookies:
-                try:
-                    await ctx.add_cookies(cookies)
-                except Exception as e:
-                    self._log(f"注入 cookie 失败（继续跑）：{e}")
+            ctx = await self._new_context()
+            await self._inject_cookies(ctx)
+            await self._block_heavy(ctx)
 
             # 本进程第一次取数：先用同一 context 访问首页，拿 api_uid 等设备 cookie。
             # 少了这一步，直接打开搜索页常常只得到一个不渲染的空壳（标题「拼多多」、
@@ -648,16 +1340,8 @@ class BrowserFetcher:
             payload = await self._wait_payload(page, keyword)
             return payload
         finally:
-            if page is not None:
-                try:
-                    await page.close()
-                except Exception:
-                    pass
-            if ctx is not None:
-                try:
-                    await ctx.close()
-                except Exception:
-                    pass
+            await self._close_quietly(page)
+            await self._close_quietly(ctx)
 
     async def _wait_payload(self, page, keyword: str) -> dict:
         """等 hook 截到明文。轮询而不是死等固定秒数，慢的时候不误杀、快的时候不浪费。"""

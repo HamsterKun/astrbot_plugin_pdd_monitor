@@ -53,6 +53,14 @@ except ImportError:  # pragma: no cover - AstrBot 按文件加载插件时没有
     except Exception:  # 模块缺失不该拖垮整个插件
         BrowserError = BrowserFetcher = BrowserUnavailable = None  # type: ignore
 
+try:  # WebUI 里的可视化登录
+    from .login_web import RemoteLogin
+except ImportError:  # pragma: no cover
+    try:
+        from login_web import RemoteLogin  # type: ignore
+    except Exception:
+        RemoteLogin = None  # type: ignore
+
 PLUGIN_NAME = "astrbot_plugin_pdd_monitor"
 DATA_FILE = "pdd_price.json"
 # 取价口径或数据源变化时递增，读到旧版本的数据文件会直接重置
@@ -62,6 +70,14 @@ DATA_VERSION = 3
 GOODS_URL = "https://mobile.yangkeduo.com/goods.html?goods_id={}"
 SEARCH_URL = "https://mobile.yangkeduo.com/search_result.html"
 HOME_URL = "https://mobile.yangkeduo.com/"
+
+# 扫码登录最多等多久：一张二维码大约两分钟过期，留出扫码加确认的余量。
+# 期间二维码到期会自动重截一张再发，不会让用户对着失效的码干等。
+LOGIN_TIMEOUT = 180.0
+
+# 扫码后可能弹「安全验证」（选一个用过的收货人姓名），这步只能人来点。
+# 把题目发出去后等这么久，没人回就放弃，浏览器一起关掉。
+VERIFY_TIMEOUT = 180.0
 
 # 默认 UA：iOS Safari。版本号与 Sec-Fetch 家族、Safari 的能力要对得上，
 # 否则「UA 说是 Safari 18，请求头却是 IE 时代的样子」本身就是破绽。
@@ -561,10 +577,27 @@ def split_error(msg: str) -> tuple[str, str, str]:
     return parts[0], parts[1], "｜".join(p for p in parts[2:] if p)
 
 
+def error_rows(msg: str) -> list[tuple[str, str]]:
+    """错误拆成「现象 / 原因 / 处理」三行，缺哪段就不显示哪行。
+
+    留一个空标签比不显示更糟：用户会以为信息在，只是没加载出来。
+    """
+    first, reason, action = split_error(msg)
+    rows = [("现象", first)] if first else []
+    if reason:
+        rows.append(("原因", reason))
+    if action:
+        rows.append(("处理", action))
+    return rows
+
+
 HELP_TEXT = "\n".join([
     f"{TAG}指令",
     "",
     f"{pad('add <关键词>', 16)}添加监控",
+    f"{pad('login', 16)}登录（在面板里操作）",
+    f"{pad('login qr', 16)}聊天里扫码登录",
+    f"{pad('验证 <序号>', 16)}聊天扫码时的安全验证",
     f"{pad('del <序号>', 16)}删除监控项",
     f"{pad('list', 16)}列出全部监控",
     f"{pad('info <序号>', 16)}单项详情",
@@ -826,6 +859,150 @@ class PDDMonitorPlugin(Star):
         self._fetcher_lock = asyncio.Lock()
         self._warm_task: Optional[asyncio.Task] = None
         self._browser_hint = ""
+        # 扫码登录期间的状态：
+        #   _login_busy  同一时间只跑一轮，重复发指令会互相顶掉浏览器
+        #   _verify_*    扫码后的「安全验证」把题目发出去，等 /盯价 验证 <序号> 回来
+        self._login_busy = False
+        self._verify_event: Optional[asyncio.Event] = None
+        self._verify_answer: Optional[int] = None
+        self._verify_count = 0
+        # WebUI 里的可视化登录会话；_web_ok 表示当前 AstrBot 支持插件 Web API
+        self._remote = None
+        self._web_ok = False
+        self._register_web()
+
+    # ---------------- WebUI：可视化登录 ----------------
+    def _register_web(self) -> None:
+        """把可视化登录的接口挂到 AstrBot 的 Dashboard 路由上。
+
+        只有 4.x 才有 `register_web_api`；老版本没有这个能力，这里安静跳过，
+        `/盯价 login qr` 那条聊天扫码的路仍然可用。
+        """
+        if RemoteLogin is None:
+            logger.warning("[pdd] login_web 模块缺失，可视化登录不可用")
+            return
+        try:
+            from astrbot.api.web import json_response  # noqa: F401
+        except Exception as e:
+            logger.info(f"[pdd] 当前 AstrBot 没有插件 Web API（{e}），可视化登录跳过")
+            return
+
+        routes = [
+            (f"/{PLUGIN_NAME}/login/state", self._web_login_state,
+             ["GET"], "登录会话状态"),
+            (f"/{PLUGIN_NAME}/login/start", self._web_login_start,
+             ["POST"], "开始登录"),
+            (f"/{PLUGIN_NAME}/login/frame", self._web_login_frame,
+             ["GET"], "登录页画面"),
+            (f"/{PLUGIN_NAME}/login/input", self._web_login_input,
+             ["POST"], "转发鼠标键盘"),
+            (f"/{PLUGIN_NAME}/login/close", self._web_login_close,
+             ["POST"], "结束登录会话"),
+        ]
+        ok = 0
+        for path, handler, methods, desc in routes:
+            try:
+                self.context.register_web_api(path, handler, methods, desc)
+                ok += 1
+            except Exception as e:
+                logger.warning(f"[pdd] 注册 Web 路由失败 {path}：{e}")
+        self._web_ok = ok == len(routes)
+        if self._web_ok:
+            logger.info("[pdd] 可视化登录已就绪：面板 → 插件 → 多多盯价 → 多多盯价登录")
+
+    async def _web_login_state(self):
+        from astrbot.api.web import json_response
+
+        remote = self._remote
+        if remote is None:
+            return json_response({"status": "idle", "message": "还没有会话",
+                                  "alive": False, "left": 0})
+        return json_response(remote.snapshot())
+
+    async def _web_login_start(self):
+        from astrbot.api.web import error_response, json_response
+
+        old = self._remote
+        if old is not None:
+            if old.alive():
+                return json_response(old.snapshot())
+            # 上一轮已经出结果但还在善后期（成功后 5 秒才退进程），
+            # 先把它收干净，免得同时挂着两台 Chromium
+            self._remote = None
+            try:
+                await old.close()
+            except Exception as e:
+                logger.debug(f"[pdd] 收上一轮登录会话出错（忽略）：{e}")
+        if self._fetch_mode() != "browser":
+            return error_response("当前取数方式是 http，没有浏览器可用", status_code=409)
+        try:
+            fetcher = self._build_fetcher(cookie="")
+        except Exception as e:
+            return error_response(f"浏览器参数有误：{e}", status_code=500)
+
+        remote = RemoteLogin(fetcher, self._remote_success)
+        self._remote = remote
+        try:
+            await remote.start()
+        except Exception as e:
+            self._remote = None
+            try:
+                await remote.close()
+            except Exception:
+                pass
+            return error_response(f"打开登录页失败：{e}", status_code=500)
+        return json_response(remote.snapshot())
+
+    async def _web_login_frame(self):
+        import base64
+
+        from astrbot.api.web import error_response, json_response
+
+        remote = self._remote
+        if remote is None:
+            return error_response("没有进行中的登录会话", status_code=409)
+        snap = remote.snapshot()
+        if not remote.alive():
+            # 已经出结果（成功/超时/被关）。这里照样回快照、只是不带画面，
+            # 前端拿到 status 就能切到「登录成功」那张卡，而不是突然断流。
+            return json_response(snap)
+        shot = await remote.frame()
+        if not shot:
+            return error_response("这一帧没截到", status_code=503)
+        snap["img"] = base64.b64encode(shot).decode()
+        return json_response(snap)
+
+    async def _web_login_input(self):
+        from astrbot.api.web import error_response, json_response, request
+
+        remote = self._remote
+        if remote is None or not remote.alive():
+            return error_response("没有进行中的登录会话", status_code=409)
+        payload = await request.json(default={})
+        ok = await remote.send(payload if isinstance(payload, dict) else {})
+        return json_response({"ok": bool(ok)})
+
+    async def _web_login_close(self):
+        from astrbot.api.web import json_response
+
+        remote, self._remote = self._remote, None
+        if remote is not None:
+            try:
+                await remote.close()
+            except Exception as e:
+                logger.debug(f"[pdd] 关登录会话出错（忽略）：{e}")
+        return json_response({"status": "closed"})
+
+    def _remote_success(self, cookie: str) -> None:
+        """可视化登录拿到 cookie：和聊天扫码那条路写的是同一份配置。"""
+        self.set_cfg("cookie", cookie)
+        # 旧会话里还留着上一个账号的 PDDAccessToken，jar 的优先级高于配置
+        self._jar.clear()
+        self.store.data.setdefault("meta", {})["cookie_jar"] = {}
+        self.store.save()
+        self._last_url = ""
+        self._browser_hint = ""
+        logger.info("[pdd] 可视化登录成功，cookie 已写入配置")
 
     # ---------------- 基础 ----------------
     def cfg(self, key: str, default: Any = None) -> Any:
@@ -863,6 +1040,42 @@ class PDDMonitorPlugin(Star):
             return [v for v in list(self.config.values()) if isinstance(v, dict)]
         except Exception:
             return []
+
+    def _cfg_parent(self, key: str, node: Any = None) -> Optional[dict]:
+        """找到配置项所在的那一层。分区化之后，值可能躺在某个 object 组里。"""
+        if node is None:
+            node = self.config
+        if not isinstance(node, dict):
+            return None
+        if key in node:
+            return node
+        for value in node.values():
+            if isinstance(value, dict):
+                found = self._cfg_parent(key, value)
+                if found is not None:
+                    return found
+        return None
+
+    def set_cfg(self, key: str, value: Any) -> bool:
+        """写配置并落盘。写回它原本待的那一层，不另造一个顶层副本。
+
+        另造副本的后果是：cfg() 读顶层拿到新值，面板上显示的还是分组里那份旧的，
+        两边长期不一致，下次改配置还会被旧值盖回去。
+        """
+        parent = self._cfg_parent(key)
+        try:
+            (parent if parent is not None else self.config)[key] = value
+        except Exception as e:
+            logger.warning(f"[pdd] 写配置失败：{e}")
+            return False
+        save = getattr(self.config, "save_config", None)
+        if callable(save):
+            try:
+                save()
+            except Exception as e:
+                logger.warning(f"[pdd] 配置保存失败：{e}")
+                return False
+        return True
 
     def _migrate_flat_config(self) -> None:
         """把旧的平铺配置搬进分区。
@@ -907,6 +1120,15 @@ class PDDMonitorPlugin(Star):
                 "（必须包含 PDDAccessToken）"
             )
         return normalize_cookie(raw)
+
+    def _cookie_or_empty(self) -> str:
+        """读 cookie，没有就返回空串，不报错。
+
+        扫码登录就是用来产生 cookie 的，那一刻还没有是正常的——在这里拦下来
+        等于「要先有 cookie 才能登录」，死循环。取数仍然走 `_cookie()`，那个才该拦。
+        """
+        raw = str(self.cfg("cookie", "") or "").strip()
+        return normalize_cookie(raw) if raw else ""
 
     def _user_agent(self) -> str:
         """UA 可配：填成你取 cookie 那台手机的同款 UA 最安全。"""
@@ -1167,28 +1389,36 @@ class PDDMonitorPlugin(Star):
             return 12
 
     def _apply_recycle(self, fetcher: Any) -> None:
-        """把当前配置里的回收阈值同步给已有实例。
+        """把当前配置里的阈值同步给已有实例。
 
         实例是复用的，阈值在构造时定死。不同步的话改完配置要重载插件才生效，
         而这类值多半是「内存涨了就先调小试试」——当场生效才有意义。
+
+        cookie 与 UA 也在这里同步：扫码登录成功时实例早就建好了（当时还没有
+        cookie），不同步就会一直拿旧凭证取数，表现为「登录了但没生效」。
         """
         try:
             fetcher.idle_timeout = self._idle_seconds()
             fetcher.max_searches = self._max_searches()
             fetcher.warm_home = bool(self.cfg("warmup_home", True))
+            fetcher.cookie = self._cookie_or_empty()
+            fetcher.user_agent = self._user_agent()
         except Exception:
             pass
 
-    async def _get_fetcher(self):
+    async def _get_fetcher(self, require_cookie: bool = True):
         """惰性启动浏览器实例，之后每轮复用。
 
         Chromium 起一次要一两秒，每轮都开关会把巡检拖成分钟级；
         但上下文（cookie + UA）每次新建，避免页面之间互相沾染。
+
+        require_cookie=False 供扫码登录用：那时候还没有 cookie，不能在这里拦。
         """
         if BrowserFetcher is None:
             raise PddFetchError(
                 "找不到 pdd_browser 模块，插件文件不完整。请整目录重新上传安装。"
             )
+        cookie = self._cookie() if require_cookie else self._cookie_or_empty()
         if self._fetcher is not None:
             self._apply_recycle(self._fetcher)
             return self._fetcher
@@ -1201,19 +1431,7 @@ class PDDMonitorPlugin(Star):
                 self._apply_recycle(self._fetcher)
                 return self._fetcher
 
-            fetcher = BrowserFetcher(
-                proxy=self._proxy(),
-                cookie=self._cookie(),
-                channel=str(self.cfg("browser_channel", "") or ""),
-                headless=bool(self.cfg("browser_headless", True)),
-                timeout=float(self.cfg("browser_timeout", 45) or 45),
-                auto_install=bool(self.cfg("browser_auto_install", True)),
-                idle_timeout=self._idle_seconds(),
-                max_searches=self._max_searches(),
-                warm_home=bool(self.cfg("warmup_home", True)),
-                user_agent=self._user_agent(),
-                on_log=lambda m: logger.debug("[pdd] %s", m),
-            )
+            fetcher = self._build_fetcher(cookie)
             try:
                 await fetcher.start()
             except BrowserUnavailable as e:
@@ -1224,6 +1442,29 @@ class PDDMonitorPlugin(Star):
                 raise PddFetchError(f"浏览器启动失败：{e}") from e
             self._fetcher = fetcher
             return fetcher
+
+    def _build_fetcher(self, cookie: str):
+        """按当前配置造一个浏览器实例（不启动）。
+
+        取数和可视化登录都从这里拿参数，省得两边各写一份、改一边忘一边。
+        """
+        if BrowserFetcher is None:
+            raise PddFetchError(
+                "找不到 pdd_browser 模块，插件文件不完整。请整目录重新上传安装。"
+            )
+        return BrowserFetcher(
+            proxy=self._proxy(),
+            cookie=cookie,
+            channel=str(self.cfg("browser_channel", "") or ""),
+            headless=bool(self.cfg("browser_headless", True)),
+            timeout=float(self.cfg("browser_timeout", 45) or 45),
+            auto_install=bool(self.cfg("browser_auto_install", True)),
+            idle_timeout=self._idle_seconds(),
+            max_searches=self._max_searches(),
+            warm_home=bool(self.cfg("warmup_home", True)),
+            user_agent=self._user_agent(),
+            on_log=lambda m: logger.debug("[pdd] %s", m),
+        )
 
     async def _browser_raw(self, keyword: str, sort: Optional[str] = None) -> dict:
         """走浏览器取一份解密后的搜索数据。
@@ -1663,6 +1904,12 @@ class PDDMonitorPlugin(Star):
                 pass
             self._curl = None
         # 浏览器和本地中继都要收掉，否则重新加载插件时会攒一堆进程
+        remote, self._remote = self._remote, None
+        if remote is not None:
+            try:
+                await remote.close()
+            except Exception as e:
+                logger.debug(f"[pdd] 关登录会话出错（忽略）：{e}")
         if self._fetcher is not None:
             try:
                 await self._fetcher.close()
@@ -1699,6 +1946,9 @@ class PDDMonitorPlugin(Star):
                 raise
             except Exception as e:
                 logger.error(f"[pdd] 巡检异常：{e}", exc_info=True)
+            # 一轮跑完就把浏览器退掉。两轮之间隔着半小时，让一个空转的 Chromium
+            # 常驻占几百兆没有任何意义——下次要用时再拉起，也就一两秒。
+            await self._idle_release_browser()
             try:
                 await self._maybe_daily_report()
             except asyncio.CancelledError:
@@ -1710,6 +1960,25 @@ class PDDMonitorPlugin(Star):
             # 冷却期内不提前开工，否则每半小时撞一次限流只会越限越久
             remain = int(self._risk_until - time.time()) if self._risk_until else 0
             await asyncio.sleep(max(interval, remain))
+
+    async def _idle_release_browser(self) -> None:
+        """巡检跑完把浏览器收掉，别让它空转占内存。
+
+        Chromium 只要活着就占着几百兆（渲染进程 + V8 堆 + 缓存），关页面、
+        关上下文都不还，只有进程退出才还。巡检间隔按半小时算，中间这段时间
+        等于白占——不如退了，下次取数再拉起来，代价一两秒。
+        """
+        fetcher = self._fetcher
+        if fetcher is None:
+            return
+        # 巡检或登录还在跑的时候别动它：手动 /盯价 check 可能正跟自动巡检叠着
+        if self._lock.locked() or self._login_busy:
+            return
+        try:
+            await asyncio.wait_for(fetcher.close(), timeout=30)
+            logger.info("[pdd] 巡检结束，已关闭浏览器释放内存")
+        except BaseException as e:      # noqa: BLE001 - 收尾不能抛
+            logger.debug(f"[pdd] 关闭浏览器时出岔子（忽略）：{e}")
 
     async def _maybe_daily_report(self) -> None:
         raw = str(self.cfg("daily_report_time", "") or "").strip()
@@ -2469,6 +2738,18 @@ class PDDMonitorPlugin(Star):
             yield event.plain_result(HELP_TEXT)
             return
 
+        if sub in ("login", "登录", "扫码"):
+            # 默认引导到 WebUI：滑块、验证码这些只能在真页面上操作
+            if arg.strip().lower() in ("qr", "码", "chat", "聊天"):
+                yield event.plain_result(await self._cmd_login(event))
+            else:
+                yield event.plain_result(self._cmd_login_hint(event))
+            return
+
+        if sub in ("验证", "verify", "选"):
+            yield event.plain_result(self._cmd_verify(arg))
+            return
+
         if sub in ("add", "添加", "加"):
             if not arg:
                 yield event.plain_result(head("用法", "/盯价 add <关键词>", "例 /盯价 add 9700X"))
@@ -2866,6 +3147,251 @@ class PDDMonitorPlugin(Star):
         rows.append(("下一步", "/盯价 debug <关键词> 验证，再 /盯价 check"))
         return head("冷却已清除") + "\n" + rows_block(rows)
 
+
+    # ---------------- 扫码登录 ----------------
+    def _login_allowed(self, event: AstrMessageEvent) -> tuple[bool, str]:
+        """群里默认不给二维码：谁扫了，谁就把自己的号绑进这台机器的浏览器。"""
+        try:
+            if event.is_private_chat():
+                return True, ""
+        except Exception:
+            pass
+        if bool(self.cfg("login_allow_group", False)):
+            return True, ""
+        return False, ("群里不生成二维码｜别人扫了就等于把自己的号绑进机器人｜"
+                       "到私聊里发 /盯价 login；确要群里用请打开配置项 login_allow_group")
+
+    def _save_qr(self, png: bytes, name: str = "qr.png") -> str:
+        """把二维码落到数据目录，供发图用。固定文件名，只留最新一张。"""
+        try:
+            folder = os.path.join(self._resolve_data_dir(), "login")
+            os.makedirs(folder, exist_ok=True)
+            path = os.path.join(folder, name)
+            with open(path, "wb") as f:
+                f.write(png)
+            return path
+        except Exception as e:
+            logger.warning(f"[pdd] 二维码落盘失败：{e}")
+            return ""
+
+    def _save_login_page(self, html: str) -> str:
+        """存一份登录页源码。
+
+        选择器没命中时才有，用来把二维码的位置对准——不然只能靠猜 DOM 结构。
+        """
+        try:
+            folder = os.path.join(self._resolve_data_dir(), "login")
+            os.makedirs(folder, exist_ok=True)
+            path = os.path.join(folder, "page.html")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(html or "")
+            return path
+        except Exception as e:
+            logger.warning(f"[pdd] 登录页快照落盘失败：{e}")
+            return ""
+
+    async def _send_once(self, umo: str, chain: Any) -> bool:
+        try:
+            return bool(await self.context.send_message(umo, chain))
+        except Exception as e:
+            logger.warning(f"[pdd] 发送失败 {umo}: {e}")
+            return False
+
+    async def _cmd_login(self, event: AstrMessageEvent) -> str:
+        """扫码登录：二维码发回会话，扫完自动把 cookie 写进配置。
+
+        为什么要绕这一圈：cookie 只能由一次真实登录产生，让用户开 F12 手抄整条
+        是最容易劝退的一步。这里借插件自己那台 Chromium 登录，cookie 全程只存在
+        服务器上，用户只负责扫一下——顺带还保证了 cookie 与这台机器的 UA、
+        api_uid 是配套的，比从手机上抄一条过来更不容易被判异常。
+        """
+        ok, why = self._login_allowed(event)
+        if not ok:
+            return head("登录未开始") + "\n" + rows_block(error_rows(why))
+
+        if self._fetch_mode() != "browser":
+            rows = [
+                ("现象", "当前取数方式是 http，没有浏览器可用"),
+                ("原因", "扫码要靠无头 Chromium 打开登录页"),
+                ("处理", "把 fetch_mode 改成 browser 后重载插件"),
+            ]
+            return head("登录未开始") + "\n" + rows_block(rows)
+
+        if self._login_busy:
+            return head("登录进行中", "上一轮还没结束") + "\n" + rows_block([
+                ("处理", "等它出结果，或等它自己超时（180 秒）"),
+                ("提示", "并发开两个登录会各起一个 Chromium，最费内存"),
+            ])
+
+        try:
+            # 这时候还没有 cookie 是正常的：登录就是为了拿它
+            fetcher = await self._get_fetcher(require_cookie=False)
+        except PddFetchError as e:
+            return head("登录未开始") + "\n" + rows_block(error_rows(str(e)))
+
+        self._login_busy = True
+
+        umo = event.unified_msg_origin
+        shots = {"n": 0}
+
+        async def deliver(png: bytes, how: str) -> None:
+            shots["n"] += 1
+            first = shots["n"] == 1
+            title = "二维码已生成" if first else "二维码已刷新，旧码作废"
+            tip = ("用拼多多 App 扫这张，手机上确认登录" if first
+                   else "前面那张过期了，扫这张")
+            chain = MessageChain().message(head(title, tip))
+            path = self._save_qr(png)
+            if path:
+                try:
+                    chain = chain.file_image(path)
+                except Exception:
+                    pass
+            else:
+                logger.warning("[pdd] 二维码没落盘，只发得出文字")
+            await self._send_once(umo, chain)
+
+        async def dump_page(html: str) -> None:
+            path = self._save_login_page(html)
+            if path:
+                logger.info(f"[pdd] 登录页快照：{path}")
+
+        async def ask(png: bytes, options: list[str]) -> int:
+            """扫码后的「安全验证」：把题目发出去，等用户回一个序号。
+
+            这步没法自动过——题目是「你用过哪个收货人姓名」，只有账号主人知道。
+            所以把整页截图和读到的选项一起发出去，让用户回 /盯价 验证 2。
+            """
+            self._verify_answer = None
+            self._verify_count = len(options)
+            self._verify_event = asyncio.Event()
+
+            tips = [head("需要你确认一步", "拼多多要做安全验证，选一个就行")]
+            if options:
+                rows = [(str(i + 1), text) for i, text in enumerate(options)]
+                tips.append(rows_block(rows))
+            else:
+                tips.append("选项没读出来，看图里那一列，按从上到下数")
+            tips.append("回复：/盯价 验证 序号（例 /盯价 验证 1，0 表示取消）")
+
+            chain = MessageChain().message("\n".join(tips))
+            path = self._save_qr(png, "verify.png")
+            if path:
+                try:
+                    chain = chain.file_image(path)
+                except Exception:
+                    pass
+            await self._send_once(umo, chain)
+
+            try:
+                await asyncio.wait_for(self._verify_event.wait(), timeout=VERIFY_TIMEOUT)
+            except asyncio.TimeoutError:
+                raise BrowserError(
+                    f"安全验证超时｜{int(VERIFY_TIMEOUT)} 秒内没选｜重发 /盯价 login"
+                ) from None
+            finally:
+                self._verify_event = None
+
+            answer = self._verify_answer
+            self._verify_answer = None
+            return -1 if answer is None else int(answer)
+
+        try:
+            # 外面再套一层超时：登录内部有自己的 180 秒计时，但收尾（关页面、
+            # 退进程）也可能卡住，一卡住浏览器就永远留在内存里了。验证环节
+            # 要等人回话，所以总上限再加上这段。
+            result = await asyncio.wait_for(
+                fetcher.login_qr(deliver, timeout=LOGIN_TIMEOUT,
+                                 on_miss=dump_page, ask=ask),
+                timeout=LOGIN_TIMEOUT + VERIFY_TIMEOUT + 45,
+            )
+        except asyncio.TimeoutError:
+            return head("登录未完成", "这轮超出预期时长，已强制收尾") + "\n" + rows_block([
+                ("现象", "扫码流程没能在这轮里走完"),
+                ("原因", "登录页或浏览器收尾卡住了"),
+                ("处理", "重发 /盯价 login；反复出现请把日志发我"),
+            ])
+        except BrowserError as e:
+            return head("登录未完成") + "\n" + rows_block(error_rows(str(e)))
+        except Exception as e:  # pragma: no cover - 兜底，别把异常甩到聊天里
+            logger.error(f"[pdd] 扫码登录异常：{e}")
+            return head("登录未完成", shorten(str(e), 60))
+        finally:
+            self._login_busy = False
+            self._verify_event = None
+            self._verify_answer = None
+            # 双保险：不管上面走哪条路，浏览器都得退掉。登录是一次性的，
+            # 里面的 login_qr 自己会关，这里再关一次是幂等的（句柄已是 None）。
+            try:
+                await asyncio.wait_for(fetcher.close(), timeout=30)
+            except BaseException:       # noqa: BLE001 - 收尾不能盖掉上面的结果
+                pass
+
+        written = self.set_cfg("cookie", result["cookie"])
+        # 旧会话里还留着上一个账号的 PDDAccessToken，而 jar 的优先级高于配置，
+        # 不清掉的话下一次取数用的还是旧身份，表现为「登录了但没生效」。
+        self._jar.clear()
+        self.store.data.setdefault("meta", {})["cookie_jar"] = {}
+        self.store.save()
+        self._last_url = ""
+        self._browser_hint = ""
+
+        rows = [
+            ("字段", f"{result['count']} 个 · 含 PDDAccessToken"),
+            ("保存", "已写入配置" if written else "写不进去，检查配置目录权限"),
+            ("验证", "/盯价 debug 纸巾"),
+        ]
+        return head("已登录") + "\n" + rows_block(rows)
+
+    def _cmd_login_hint(self, event: AstrMessageEvent) -> str:
+        """登录指引：默认把用户带到 WebUI 里那台「远程登录页」。"""
+        ok, why = self._login_allowed(event)
+        if not ok:
+            return head("登录未开始") + "\n" + rows_block(error_rows(why))
+
+        if self._fetch_mode() != "browser":
+            return head("登录未开始") + "\n" + rows_block([
+                ("现象", "当前取数方式是 http，没有浏览器可用"),
+                ("处理", "把 fetch_mode 改成 browser 后重载插件"),
+            ])
+
+        if not self._web_ok:
+            return head("面板登录不可用", "当前 AstrBot 不支持插件页面") + "\n" + rows_block([
+                ("原因", "没有 register_web_api（需要 AstrBot 4.24.2 以上）"),
+                ("备选", "/盯价 login qr 走聊天扫码，或按 README 手工复制 Cookie"),
+            ])
+
+        return head("登录去面板里点", "浏览器跑在服务器上，画面搬到面板") + "\n" + rows_block([
+            ("入口", "管理面板 → 插件 → 多多盯价 → 多多盯价登录"),
+            ("操作", "页面里就是拼多多登录页，扫码、滑块、验证都能直接点"),
+            ("结果", "登录成功后自动写入配置，页面会提示「登录成功」"),
+            ("备选", "/盯价 login qr 走聊天扫码（简单验证能用，滑块不行）"),
+        ])
+
+    def _cmd_verify(self, arg: str) -> str:
+        """安全验证：把用户选的序号交给正在等待的登录流程。
+
+        这个指令跟 /盯价 login 是两条并行的消息，不共享协程，所以只用
+        一个 Event + 一个序号来传话，不需要把浏览器页面传来传去。
+        """
+        if self._verify_event is None:
+            return head("没有待确认的验证") + "\n" + rows_block([
+                ("现象", "现在没有登录流程在等这一步"),
+                ("处理", "先发 /盯价 login，等它把题目发过来"),
+            ])
+        digits = re.sub(r"[^0-9]", "", arg or "")
+        if not digits:
+            return head("用法", "/盯价 验证 <序号>", "例 /盯价 验证 1，0 表示取消")
+        n = int(digits)
+        if n == 0:
+            self._verify_answer = -1
+            self._verify_event.set()
+            return head("已取消", "这轮登录作废，浏览器会一起关掉")
+        if self._verify_count and n > self._verify_count:
+            return head("序号超范围", f"这次一共 {self._verify_count} 项")
+        self._verify_answer = n - 1
+        self._verify_event.set()
+        return head("已选择", f"第 {n} 项，正在提交")
 
     async def _cmd_debug(self, arg: str) -> str:
         target = arg.strip()

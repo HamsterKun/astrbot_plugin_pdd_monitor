@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>多多盯价登录</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <header class="bar" id="bar">
+      <span id="state" class="chip" data-kind="idle">
+        <i class="dot"></i><span id="state-text">准备中…</span>
+      </span>
+      <span class="grow"></span>
+      <button id="btn-start" class="btn primary">开始登录</button>
+      <button id="btn-reload" class="btn" disabled>刷新页面</button>
+      <button id="btn-close" class="btn danger" disabled>结束会话</button>
+    </header>
+
+    <main class="stage" id="stage">
+      <img id="screen" alt="登录页画面" />
+      <p id="hint" class="hint">
+        点「开始登录」，这里会显示拼多多的登录页。<br />
+        页面跑在服务器那台浏览器里，你在上面点、拖、扫码，cookie 直接落到服务器。
+      </p>
+
+      <div id="overlay" class="overlay" hidden>
+        <div class="card" id="ov-card" data-kind="ok">
+          <div class="mark" id="ov-mark">✓</div>
+          <h2 id="ov-title">登录成功</h2>
+          <p id="ov-desc"></p>
+          <div class="acts">
+            <button id="ov-again" class="btn primary">再登一次</button>
+            <button id="ov-dismiss" class="btn">知道了</button>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <footer class="typing" id="typing">
+      <input id="text" type="text" autocomplete="off" spellcheck="false"
+             placeholder="要打字时：先点画面里的输入框，再在这里输入" />
+      <button id="btn-type" class="btn">发送文字</button>
+    </footer>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
